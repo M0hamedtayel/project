@@ -1,0 +1,22 @@
+# ============================================================
+# requirements.txt — ULP Processor
+# ============================================================
+# Install with:
+#   pip install -r requirements.txt
+
+# --- search_and_index.py ---
+requests>=2.31.0          # HTTP client (Ollama AI calls)
+tldextract>=5.1.1         # Domain extraction from URLs / emails
+elasticsearch>=8.13.0     # Elasticsearch Python client (bulk index + search)
+
+# --- ulp_ingest.py ---
+clickhouse-connect>=0.7.0 # ClickHouse Python client (batch inserts)
+
+# ============================================================
+# ripgrep must be installed separately at the OS level:
+#   Ubuntu/Debian : sudo apt install ripgrep
+#   Fedora/RHEL   : sudo dnf install ripgrep
+#   Arch          : sudo pacman -S ripgrep
+#   macOS         : brew install ripgrep
+#   Windows       : winget install BurntSushi.ripgrep.MSVC
+# ============================================================

@@ -1,0 +1,37 @@
+database
+leak
+breach
+dump
+combo
+ssn
+email:password
+mail:pass
+user:pass
+pass:user
+data leak
+sql dump
+csv
+credit card
+fullz
+dox
+credentials
+account dump
+cracked
+logs
+hits
+access
+panel
+shell
+backdoor
+exploit
+ransom
+phish
+carding
+spreadsheet
+xlsx
+mail pass
+combolist
+leaked
+db dump
+data breach
+sql file

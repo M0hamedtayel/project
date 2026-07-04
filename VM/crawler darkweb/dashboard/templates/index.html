@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dark Web Monitor — Dashboard</title>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:#0a0e17;color:#e2e8f0;padding:20px}
+.app{max-width:1400px;margin:0 auto}
+
+.header{display:flex;justify-content:space-between;align-items:center;padding:16px 24px;background:#111827;border:1px solid #1e293b;border-radius:10px;margin-bottom:16px}
+.header h1{font-size:20px;display:flex;align-items:center;gap:10px}
+.header h1 i{color:#22d3ee}
+.dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+.dot.on{background:#22c55e;animation:pulse 1.5s infinite}
+.dot.off{background:#64748b}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+.nav{display:flex;gap:4px;background:#111827;padding:6px;border-radius:10px;border:1px solid #1e293b;margin-bottom:16px;flex-wrap:wrap}
+.nav button{padding:8px 16px;border:none;background:transparent;color:#64748b;border-radius:6px;cursor:pointer;font-size:13px;display:flex;align-items:center;gap:6px;transition:.2s}
+.nav button:hover{color:#e2e8f0;background:rgba(255,255,255,.05)}
+.nav button.active{color:#22d3ee;background:rgba(34,211,238,.1)}
+
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px}
+.card{background:#111827;border:1px solid #1e293b;border-radius:10px;padding:18px;text-align:center}
+.card .n{font-size:28px;font-weight:700;margin:4px 0}
+.card .l{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.5px}
+.card .s{font-size:11px;color:#64748b;margin-top:4px}
+
+.section{background:#111827;border:1px solid #1e293b;border-radius:10px;padding:20px;margin-bottom:16px}
+.section h2{font-size:15px;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.section h2 i{color:#22d3ee}
+
+.tb{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #1e293b}
+th{color:#64748b;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+tr:hover td{background:rgba(255,255,255,.02)}
+
+.bg{padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;display:inline-block}
+.bg-g{background:rgba(34,197,94,.15);color:#22c55e}
+.bg-r{background:rgba(239,68,68,.15);color:#ef4444}
+.bg-y{background:rgba(234,179,8,.15);color:#eab308}
+.bg-b{background:rgba(34,211,238,.15);color:#22d3ee}
+
+.bar{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+.bar input,.bar select{padding:8px 12px;background:#0a0e17;border:1px solid #1e293b;border-radius:6px;color:#e2e8f0;font-size:13px;outline:none;min-width:180px}
+.bar input:focus,.bar select:focus{border-color:#22d3ee}
+.bar button{padding:8px 16px;background:#22d3ee;color:#000;border:none;border-radius:6px;cursor:pointer;font-weight:600;font-size:13px}
+.bar button:hover{opacity:.85}
+.bar button:disabled{opacity:.4;cursor:default}
+
+.pg{display:flex;gap:6px;justify-content:center;margin-top:14px}
+.pg button{padding:6px 12px;background:#0a0e17;border:1px solid #1e293b;border-radius:4px;color:#e2e8f0;cursor:pointer;font-size:12px}
+.pg button:disabled{opacity:.4;cursor:default}
+
+.feed{max-height:500px;overflow-y:auto;font-size:12px;font-family:monospace}
+.feed .fi{padding:6px 0;border-bottom:1px solid #1e293b;display:flex;gap:10px}
+.feed .tm{color:#64748b;white-space:nowrap}
+.feed .tag{font-weight:600}
+.tag-n{color:#22c55e}
+.tag-d{color:#eab308}
+.tag-i{color:#22d3ee}
+.tag-w{color:#ef4444}
+
+.lv{max-height:500px;overflow-y:auto;font-family:monospace;font-size:12px}
+.lv .ll{padding:3px 8px;display:flex;gap:10px}
+.lv .ll:hover{background:rgba(255,255,255,.03)}
+.li{color:#22d3ee}
+.lw{color:#eab308}
+.le{color:#ef4444}
+
+.c2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:768px){.c2{grid-template-columns:1fr}}
+.cc{background:#0a0e17;border:1px solid #1e293b;border-radius:8px;padding:16px}
+.cc h3{font-size:14px;margin-bottom:10px;display:flex;align-items:center;gap:8px}
+.btn{padding:8px 20px;border:none;border-radius:6px;cursor:pointer;font-weight:600;font-size:13px;display:inline-flex;align-items:center;gap:6px}
+.bp{background:#22d3ee;color:#000}
+.br{background:#ef4444;color:#fff}
+.bo{background:transparent;border:1px solid #1e293b;color:#e2e8f0}
+.bo:hover{border-color:#22d3ee}
+.bs{padding:5px 12px;font-size:11px}
+.sm{color:#64748b;font-size:12px;margin-top:4px}
+.fx{display:flex;align-items:center;gap:8px}
+.mt{margin-top:8px}
+a{color:#22d3ee;text-decoration:none}
+.loading{text-align:center;padding:30px;color:#64748b}
+.err{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);border-radius:6px;padding:10px;color:#ef4444;font-size:12px;margin:8px 0}
+</style>
+</head>
+<body>
+<div id="app" class="app">
+  <header class="header">
+    <h1><i class="fas fa-shield-halved"></i> Dark Web Monitor</h1>
+    <div class="fx">
+      <span class="dot" :class="running ? 'on' : 'off'"></span>
+      <span class="sm">{{ running ? 'Crawler Running' : 'Idle' }}</span>
+    </div>
+  </header>
+
+  <nav class="nav">
+    <button v-for="t in tabs" :key="t.k" :class="{active:tab===t.k}" @click="tab=t.k">
+      <i :class="t.i"></i> {{t.l}}
+    </button>
+  </nav>
+
+  <!-- ─── OVERVIEW ─── -->
+  <div v-show="tab==='ov'">
+    <div class="grid">
+      <div class="card"><div class="n">{{stats.total_threads}}</div><div class="l">Threads</div></div>
+      <div class="card"><div class="n">{{stats.total_forums}}</div><div class="l">Forums</div></div>
+      <div class="card"><div class="n" style="color:#eab308">{{stats.total_flagged}}</div><div class="l">Flagged</div>
+        <div class="s" v-if="stats.unreviewed">{{stats.unreviewed}} unreviewed</div></div>
+      <div class="card"><div class="n" :style="{color:running?'#22c55e':'#64748b'}">{{running?'Live':'Idle'}}</div>
+        <div class="l">Crawler</div>
+        <div class="s" v-if="stats.last_crawl">Last: {{timeAgo(stats.last_crawl)}}</div></div>
+    </div>
+
+    <div class="section">
+      <h2><i class="fas fa-table-list"></i> Forums Status</h2>
+      <div class="loading" v-if="!forums.length">Loading...</div>
+      <div class="tb" v-else>
+        <table>
+          <thead><tr><th>Forum</th><th>Type</th><th>Threads</th><th>Last Crawl</th><th>Status</th></tr></thead>
+          <tbody>
+            <tr v-for="f in forums" :key="f.id">
+              <td><strong>{{f.name}}</strong><br><span class="sm">{{shortUrl(f.url)}}</span></td>
+              <td><span class="bg" :class="f.type==='onion'?'bg-y':'bg-b'">{{f.type}}</span></td>
+              <td>{{f.threads}}</td>
+              <td class="sm">{{f.last_crawl ? timeAgo(f.last_crawl) : '—'}}</td>
+              <td><span class="bg" :class="f.status==='done'?'bg-g':f.status==='running'?'bg-y':'bg-r'">{{f.status}}</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── FORUMS ─── -->
+  <div v-show="tab==='fr'">
+    <div class="section">
+      <h2><i class="fas fa-eye"></i> All Forums</h2>
+      <div class="loading" v-if="!forums.length">Loading...</div>
+      <div class="tb" v-else>
+        <table>
+          <thead><tr><th>Name</th><th>Threads</th><th>Status</th><th>Active</th><th>Last Crawl</th></tr></thead>
+          <tbody>
+            <tr v-for="f in forums" :key="f.id">
+              <td><strong>{{f.name}}</strong><br><span class="sm">{{shortUrl(f.url)}}</span></td>
+              <td>{{f.threads}}</td>
+              <td><span class="bg" :class="f.status==='done'?'bg-g':f.status==='running'?'bg-y':'bg-r'">{{f.status}}</span></td>
+              <td><span class="bg" :class="f.active?'bg-g':'bg-r'">{{f.active?'Active':'Inactive'}}</span></td>
+              <td class="sm">{{f.last_crawl ? timeAgo(f.last_crawl) : '—'}}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── SEARCH ─── -->
+  <div v-show="tab==='sr'">
+    <div class="section">
+      <h2><i class="fas fa-search"></i> Search Threads</h2>
+      <div class="bar">
+        <input v-model="sq" placeholder="Search title or content..." @keyup.enter="search">
+        <select v-model="sf"><option value="">All Forums</option><option v-for="f in forums" :key="f.id" :value="f.id">{{f.name}}</option></select>
+        <button @click="search"><i class="fas fa-search"></i> Search</button>
+      </div>
+      <div class="loading" v-if="searchLoading">Searching...</div>
+      <div class="tb" v-else-if="sr.length">
+        <table>
+          <thead><tr><th>Title</th><th>Author</th><th>Forum</th><th>Date</th></tr></thead>
+          <tbody>
+            <tr v-for="t in sr" :key="t.id">
+              <td><a :href="t.url" target="_blank">{{t.title.slice(0,80)}}</a><div class="sm" style="margin-top:2px">{{t.content.slice(0,100)}}</div></td>
+              <td>{{t.author||'?'}}</td>
+              <td><span class="sm">{{forumName(t.forum_id)}}</span></td>
+              <td class="sm">{{t.date}}</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="pg">
+          <button :disabled="sp<=1" @click="sp--;search()">Prev</button>
+          <span class="sm" style="padding:6px">{{sp}} / {{Math.ceil(st/20)}}</span>
+          <button :disabled="sp*20>=st" @click="sp++;search()">Next</button>
+        </div>
+      </div>
+      <div v-else-if="searchDone" class="loading">No results</div>
+    </div>
+  </div>
+
+  <!-- ─── FLAGGED ─── -->
+  <div v-show="tab==='fl'">
+    <div class="section">
+      <h2><i class="fas fa-flag"></i> Flagged Leaks <span class="bg bg-r" style="margin-left:8px">{{ft}}</span></h2>
+      <div class="bar">
+        <input v-model="fq" placeholder="Search flagged..." @keyup.enter="loadFlagged">
+        <select v-model="fr">
+          <option value="">All</option>
+          <option value="false">Unreviewed</option>
+          <option value="true">Reviewed</option>
+        </select>
+        <button @click="loadFlagged(true)"><i class="fas fa-search"></i></button>
+      </div>
+      <div class="loading" v-if="flagLoading">Loading...</div>
+      <div class="tb" v-else-if="fl.length">
+        <table>
+          <thead><tr><th>Title</th><th>Keywords</th><th>Flagged</th><th>Action</th></tr></thead>
+          <tbody>
+            <tr v-for="t in fl" :key="t.id" :style="{opacity: t.reviewed ? 0.5 : 1}">
+              <td><a :href="t.url" target="_blank">{{(t.title||'').slice(0,60)}}</a></td>
+              <td><span v-for="kw in (t.keywords||[])" :key="kw" class="bg bg-y" style="margin:1px">{{kw}}</span></td>
+              <td class="sm">{{t.flagged_at?timeAgo(t.flagged_at):'—'}}</td>
+              <td><button v-if="!t.reviewed" class="btn bs bp" @click="markReviewed(t.id)">Mark Reviewed</button><span v-else class="bg bg-g">Reviewed</span></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="pg">
+          <button :disabled="fp<=1" @click="fp--;loadFlagged()">Prev</button>
+          <span class="sm" style="padding:6px">{{fp}} / {{Math.ceil(ft/20)}}</span>
+          <button :disabled="fp*20>=ft" @click="fp++;loadFlagged()">Next</button>
+        </div>
+      </div>
+      <div v-else class="loading">No flagged threads</div>
+    </div>
+  </div>
+
+  <!-- ─── LIVE ─── -->
+  <div v-show="tab==='lv'">
+    <div class="section">
+      <h2><i class="fas fa-rss"></i> Live Feed <span class="dot" :class="running?'on':'off'" style="margin-left:8px;vertical-align:middle"></span></h2>
+      <div class="feed" ref="feedEl">
+        <div v-for="e in feed" :key="e.id" class="fi">
+          <span class="tm">{{e.t}}</span>
+          <span class="tag" :class="e.c">{{e.g}}</span>
+          <span>{{e.m}}</span>
+        </div>
+        <div v-if="!feed.length" class="loading">Waiting for crawl events...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── LOGS ─── -->
+  <div v-show="tab==='lg'">
+    <div class="section">
+      <h2><i class="fas fa-receipt"></i> Crawler Logs</h2>
+      <div class="bar">
+        <select v-model="ll"><option value="">All</option><option>INFO</option><option>WARNING</option><option>ERROR</option></select>
+        <input v-model="lq" placeholder="Search..." @keyup.enter="loadLogs">
+        <button @click="loadLogs"><i class="fas fa-rotate"></i> Refresh</button>
+      </div>
+      <div class="lv">
+        <div v-for="l in logs" :key="l.timestamp+l.message" class="ll">
+          <span class="sm" style="min-width:140px">{{l.timestamp}}</span>
+          <span :class="'l'+l.level[0].toLowerCase()" style="min-width:60px">[{{l.level}}]</span>
+          <span>{{l.message.slice(0,300)}}</span>
+        </div>
+        <div v-if="!logs.length" class="loading">No logs</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── CONTROLS ─── -->
+  <div v-show="tab==='ct'">
+    <div class="c2">
+      <div class="cc">
+        <h3><i class="fas fa-play" style="color:#22d3ee"></i> Crawler Control</h3>
+        <div class="fx" style="margin-bottom:8px">
+          <select v-model="ct" style="padding:8px;background:#0a0e17;border:1px solid #1e293b;border-radius:6px;color:#e2e8f0;font-size:13px">
+            <option value="clearnet">Clearnet</option>
+            <option value="onion">Onion</option>
+            <option value="all">All</option>
+          </select>
+          <button class="btn bp" :disabled="running" @click="startCrawl"><i class="fas fa-play"></i> Start</button>
+          <button class="btn br" :disabled="!running" @click="stopCrawl"><i class="fas fa-stop"></i> Stop</button>
+        </div>
+        <div class="sm">{{running ? 'Crawler running' : 'Crawler idle'}}</div>
+        <div class="err" v-if="crawlErr">{{crawlErr}}</div>
+      </div>
+
+      <div class="cc">
+        <h3><i class="fas fa-cookie" style="color:#eab308"></i> Cookies Health</h3>
+        <div v-for="c in cookies" :key="c.domain" style="background:#111827;border:1px solid #1e293b;border-radius:6px;padding:12px;margin-bottom:8px">
+          <div class="fx" style="justify-content:space-between">
+            <strong>{{c.domain}}</strong>
+            <span class="bg" :class="c.valid==true?'bg-g':c.valid==false?'bg-r':'bg-y'">{{c.valid==true?'Valid':c.valid==false?'Invalid':'Unknown'}}</span>
+          </div>
+          <div class="sm">File: {{c.filename}} | Age: {{c.age_hours}}h</div>
+          <div class="sm" v-if="c.threads!==undefined">Test: {{c.threads}} threads found</div>
+          <button class="btn bs bo mt" @click="testCookie(c)"><i class="fas fa-flask"></i> Test</button>
+          <div class="err" v-if="c.err">{{c.err}}</div>
+        </div>
+        <div v-if="!cookies.length" class="sm">No cookie files</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const {createApp} = Vue;
+createApp({
+  data(){return{
+    tab:'ov',running:false,stats:{},forums:[],
+    tabs:[
+      {k:'ov',l:'Overview',i:'fas fa-chart-simple'},
+      {k:'fr',l:'Forums',i:'fas fa-table-list'},
+      {k:'sr',l:'Search',i:'fas fa-search'},
+      {k:'fl',l:'Flagged',i:'fas fa-flag'},
+      {k:'lv',l:'Live',i:'fas fa-rss'},
+      {k:'lg',l:'Logs',i:'fas fa-receipt'},
+      {k:'ct',l:'Controls',i:'fas fa-gear'},
+    ],
+    sq:'',sf:'',sp:1,sr:[],st:0,searchLoading:false,searchDone:false,
+    fq:'',fr:'',fp:1,fl:[],ft:0,flagLoading:false,
+    feed:[],fid:0,
+    logs:[],ll:'',lq:'',
+    ct:'clearnet',crawlErr:'',
+    cookies:[],ws:null,pi:null,
+  }},
+  methods:{
+    async api(url,opts={}){
+      try{
+        const r=await fetch(url,opts);
+        return await r.json();
+      }catch(e){return {}}
+    },
+    async loadStats(){
+      const s=await this.api('/api/stats');
+      this.stats=s;
+      this.running=!!s.crawler_running;
+    },
+    async loadForums(){
+      const f=await this.api('/api/forums');
+      if(Array.isArray(f))this.forums=f;
+    },
+    async search(){
+      this.sp=1;this.searchLoading=true;this.searchDone=true;
+      const r=await this.api(`/api/threads?q=${encodeURIComponent(this.sq)}&forum=${this.sf}&page=${this.sp}`);
+      this.sr=r.threads||[];this.st=r.total||0;this.searchLoading=false;
+    },
+    async loadFlagged(resetPage){
+      if(resetPage)this.fp=1;
+      this.flagLoading=true;
+      const r=await this.api(`/api/flagged?q=${encodeURIComponent(this.fq)}&reviewed=${this.fr}&page=${this.fp}`);
+      this.fl=r.threads||[];this.ft=r.total||0;this.flagLoading=false;
+    },
+    async markReviewed(id){
+      await this.api(`/api/flagged/${id}`,{method:'PATCH'});
+      this.loadFlagged();
+    },
+    async loadLogs(){
+      const r=await this.api(`/api/logs?level=${this.ll}&q=${encodeURIComponent(this.lq)}`);
+      this.logs=r.logs||[];
+    },
+    async loadCookies(){
+      const r=await this.api('/api/cookies/files');
+      this.cookies=r.files||[];
+    },
+    async testCookie(c){
+      c.valid=null;c.threads=null;c.err='';
+      const r=await this.api('/api/cookies/test',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({domain:c.domain}),
+      });
+      c.valid=r.valid;c.threads=r.threads;c.err=r.error||'';
+    },
+    async startCrawl(){
+      this.crawlErr='';
+      const r=await this.api('/api/crawl/start',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({crawler:this.ct}),
+      });
+      if(r.status==='started'){this.running=true}
+      else if(r.error){this.crawlErr=r.error}
+    },
+    async stopCrawl(){
+      await this.api('/api/crawl/stop',{method:'POST'});
+      this.running=false;
+    },
+    forumName(id){const f=this.forums.find(x=>x.id===id);return f?f.name:''},
+    shortUrl(u){return (u||'').replace('https://','').replace('http://','').split('/')[0]},
+    timeAgo(d){
+      if(!d)return'';
+      const diff=(Date.now()-new Date(d).getTime())/1000;
+      if(diff<60)return'just now';
+      if(diff<3600)return Math.floor(diff/60)+'m ago';
+      if(diff<86400)return Math.floor(diff/3600)+'h ago';
+      return Math.floor(diff/86400)+'d ago';
+    },
+    addFeed(tag,cls,msg){
+      this.feed.unshift({id:this.fid++,t:new Date().toTimeString().slice(0,8),g:tag,c:cls,m:msg.slice(0,200)});
+      if(this.feed.length>200)this.feed.pop();
+    },
+    connectWS(){
+      const p=location.protocol==='https:'?'wss:':'ws:';
+      this.ws=new WebSocket(`${p}//${location.host}/ws`);
+      this.ws.onmessage=e=>{
+        const ev=JSON.parse(e.data);
+        if(ev.type==='crawl_log'){
+          const l=ev.line;
+          let tag='INFO',cls='tag-i';
+          if(l.includes('[NEW]')){tag='NEW';cls='tag-n'}
+          else if(l.includes('[DUPLICATE]')){tag='DUP';cls='tag-d'}
+          else if(l.includes('WARNING')){tag='WARN';cls='tag-w'}
+          else if(l.includes('ERROR')){tag='ERR';cls='tag-w'}
+          this.addFeed(tag,cls,l);
+        }
+        if(ev.type==='crawl_done'||ev.type==='crawl_stopped'){this.running=false;this.loadStats()}
+      };
+      this.ws.onclose=()=>setTimeout(()=>this.connectWS(),3000);
+    },
+    poll(){
+      this.loadStats();
+      if(this.tab==='fl')this.loadFlagged();
+    },
+  },
+  watch:{
+    tab(t){
+      if(t==='fl')this.loadFlagged(true);
+      if(t==='lg')this.loadLogs();
+    },
+  },
+  mounted(){
+    this.loadStats();this.loadForums();this.loadLogs();this.loadCookies();
+    this.connectWS();
+    this.pi=setInterval(()=>this.poll(),3000);
+  },
+  beforeUnmount(){
+    if(this.pi)clearInterval(this.pi);
+    if(this.ws)this.ws.close();
+  },
+}).mount('#app');
+</script>
+</body>
+</html>

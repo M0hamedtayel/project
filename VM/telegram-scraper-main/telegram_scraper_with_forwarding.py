@@ -1,0 +1,2641 @@
+import os
+import sqlite3
+import json
+import csv
+import asyncio
+import time
+import sys
+import uuid
+import warnings
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Any
+from pathlib import Path
+from io import StringIO
+from telethon import TelegramClient, events
+from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage, User, PeerChannel, Channel, Chat
+from telethon.errors import FloodWaitError, SessionPasswordNeededError
+import re
+import qrcode
+
+warnings.filterwarnings("ignore", message="Using async sessions support is an experimental feature")
+
+# Optional proxy support - install with: pip install pysocks python-socks[asyncio]
+try:
+    import socks
+    PROXY_SUPPORT = True
+except ImportError:
+    PROXY_SUPPORT = False
+
+def display_ascii_art():
+    WHITE = "\033[97m"
+    RESET = "\033[0m"
+    art = r"""
+___________________  _________
+\__    ___/  _____/ /   _____/
+  |    | /   \  ___ \_____  \ 
+  |    | \    \_\  \/        \
+  |____|  \______  /_______  /
+                 \/        \/
+    """
+    print(WHITE + art + RESET)
+
+@dataclass
+class MessageData:
+    message_id: int
+    date: str
+    sender_id: int
+    first_name: Optional[str]
+    last_name: Optional[str]
+    username: Optional[str]
+    message: str
+    media_type: Optional[str]
+    media_path: Optional[str]
+    reply_to: Optional[int]
+    post_author: Optional[str]
+    views: Optional[int]
+    forwards: Optional[int]
+    reactions: Optional[str]
+
+@dataclass
+class ForwardingRule:
+    source_channel: str
+    destination_channel: str
+    forward_text: bool = True
+    forward_images: bool = True
+    forward_videos: bool = True
+    forward_documents: bool = True
+    forward_mode: str = "copy"
+    enabled: bool = True
+
+class OptimizedTelegramScraper:
+    def __init__(self):
+        self.STATE_FILE = 'state.json'
+        self.state = self.load_state()
+        self.client = None
+        self.continuous_scraping_active = False
+        self.forwarding_active = False
+        self.max_concurrent_downloads = 5
+        self.batch_size = 100
+        self.state_save_interval = 50
+        self.db_connections = {}
+        self.forwarding_handler = None
+        
+    def load_state(self) -> Dict[str, Any]:
+        if os.path.exists(self.STATE_FILE):
+            try:
+                with open(self.STATE_FILE, 'r') as f:
+                    return json.load(f)
+            except:
+                pass
+        return {
+            'api_id': None,
+            'api_hash': None,
+            'channels': {},
+            'channel_names': {},
+            'scrape_media': True,
+            'media_download_root': None,
+            'media_download_roots': {},
+            'forwarding_rules': [],
+            'proxy': None,
+        }
+
+    def save_state(self):
+        try:
+            with open(self.STATE_FILE, 'w') as f:
+                json.dump(self.state, f, indent=2)
+        except Exception as e:
+            print(f"Failed to save state: {e}")
+
+    def get_media_root(self, channel: Optional[str] = None) -> Path:
+        if channel:
+            channel_roots = self.state.get('media_download_roots', {})
+            root = channel_roots.get(channel)
+            if root:
+                return Path(root)
+
+        root = self.state.get('media_download_root')
+        if root:
+            return Path(root)
+        return Path('.')
+
+    def configure_media_download_folder(self):
+        print("\n========== MEDIA DOWNLOAD FOLDER ==========")
+        current = self.state.get('media_download_root')
+        if current:
+            print(f"Current folder: {current}")
+        else:
+            print("Current folder: default project folder")
+        per_channel = self.state.get('media_download_roots', {})
+        if per_channel:
+            print("Per-channel overrides:")
+            for channel, path in per_channel.items():
+                display_name = self.state.get('channel_names', {}).get(channel, channel)
+                print(f"  - {display_name} ({channel}): {path}")
+        print("Enter a folder path to store downloaded media.")
+        print("Leave blank to use the current project folder.")
+
+        scope = input("Apply to [G]lobal default or [C]hannel(s)? [G/c]: ").strip().lower()
+        if scope == 'c':
+            if not self.state['channels']:
+                print("\n❌ No channels available. Add channels first.")
+                return
+
+            print("\nTracked channels:")
+            for i, (channel, last_id) in enumerate(self.state['channels'].items(), 1):
+                channel_name = self.state.get('channel_names', {}).get(channel, 'Unknown')
+                print(f"[{i}] {channel_name} (ID: {channel}, last scraped: {last_id})")
+            print("\nSelect channels to apply a media folder to:")
+            print("• Single: 1 or -1001234567890")
+            print("• Multiple: 1,2,3 or mix formats")
+            print("• All channels: all")
+            selection = input("Enter selection: ").strip()
+            selected_channels = self.parse_channel_selection(selection)
+            if not selected_channels:
+                print("\n❌ No valid channels selected")
+                return
+
+            folder = input("Media download folder: ").strip()
+            if not folder:
+                for channel in selected_channels:
+                    self.state.setdefault('media_download_roots', {}).pop(channel, None)
+                self.save_state()
+                print("\n✅ Per-channel media folder reset to the default project folder")
+                return
+
+            try:
+                path = Path(folder).expanduser().resolve()
+                path.mkdir(parents=True, exist_ok=True)
+                roots = self.state.setdefault('media_download_roots', {})
+                for channel in selected_channels:
+                    roots[channel] = str(path)
+                self.save_state()
+                print(f"\n✅ Media download folder set for {len(selected_channels)} channel(s): {path}")
+            except Exception as e:
+                print(f"\n❌ Could not use that folder: {e}")
+            return
+
+        folder = input("Global media download folder: ").strip()
+        if not folder:
+            self.state['media_download_root'] = None
+            self.save_state()
+            print("\n✅ Media download folder reset to the default project folder")
+            return
+
+        try:
+            path = Path(folder).expanduser().resolve()
+            path.mkdir(parents=True, exist_ok=True)
+            self.state['media_download_root'] = str(path)
+            self.save_state()
+            print(f"\n✅ Media download folder set to: {path}")
+        except Exception as e:
+            print(f"\n❌ Could not use that folder: {e}")
+
+    def clear_media_download_overrides(self):
+        per_channel = self.state.get('media_download_roots', {})
+        if not per_channel:
+            print("\nNo per-channel media folder overrides are set.")
+            return
+
+        print("\nPer-channel media folder overrides:")
+        for channel, path in per_channel.items():
+            display_name = self.state.get('channel_names', {}).get(channel, channel)
+            print(f"  - {display_name} ({channel}): {path}")
+
+        confirm = input("Clear all per-channel overrides? (y/n): ").lower().strip()
+        if confirm != 'y':
+            print("\nCancelled.")
+            return
+
+        self.state['media_download_roots'] = {}
+        self.save_state()
+        print("\n✅ Cleared all per-channel media folder overrides")
+
+    def get_forwarding_rules(self) -> List[ForwardingRule]:
+        rules = []
+        for rule_dict in self.state.get('forwarding_rules', []):
+            rules.append(ForwardingRule(
+                source_channel=rule_dict['source_channel'],
+                destination_channel=rule_dict['destination_channel'],
+                forward_text=rule_dict.get('forward_text', True),
+                forward_images=rule_dict.get('forward_images', True),
+                forward_videos=rule_dict.get('forward_videos', True),
+                forward_documents=rule_dict.get('forward_documents', True),
+                forward_mode=rule_dict.get('forward_mode', 'copy'),
+                enabled=rule_dict.get('enabled', True)
+            ))
+        return rules
+
+    def save_forwarding_rule(self, rule: ForwardingRule):
+        rule_dict = {
+            'source_channel': rule.source_channel,
+            'destination_channel': rule.destination_channel,
+            'forward_text': rule.forward_text,
+            'forward_images': rule.forward_images,
+            'forward_videos': rule.forward_videos,
+            'forward_documents': rule.forward_documents,
+            'forward_mode': rule.forward_mode,
+            'enabled': rule.enabled
+        }
+        
+        existing_idx = None
+        for i, existing in enumerate(self.state.get('forwarding_rules', [])):
+            if (existing['source_channel'] == rule.source_channel and 
+                existing['destination_channel'] == rule.destination_channel):
+                existing_idx = i
+                break
+        
+        if existing_idx is not None:
+            self.state['forwarding_rules'][existing_idx] = rule_dict
+        else:
+            if 'forwarding_rules' not in self.state:
+                self.state['forwarding_rules'] = []
+            self.state['forwarding_rules'].append(rule_dict)
+        
+        self.save_state()
+
+    def remove_forwarding_rule(self, index: int) -> bool:
+        if 0 <= index < len(self.state.get('forwarding_rules', [])):
+            del self.state['forwarding_rules'][index]
+            self.save_state()
+            return True
+        return False
+
+    def get_db_connection(self, channel: str) -> sqlite3.Connection:
+        if channel not in self.db_connections:
+            channel_dir = Path(channel)
+            channel_dir.mkdir(exist_ok=True)
+
+            db_file = channel_dir / f'{channel}.db'
+            conn = sqlite3.connect(str(db_file), check_same_thread=False, timeout=30)
+            conn.execute('''CREATE TABLE IF NOT EXISTS messages
+                          (id INTEGER PRIMARY KEY, message_id INTEGER UNIQUE, date TEXT,
+                           sender_id INTEGER, first_name TEXT, last_name TEXT, username TEXT,
+                           message TEXT, media_type TEXT, media_path TEXT, reply_to INTEGER,
+                           post_author TEXT, views INTEGER, forwards INTEGER, reactions TEXT)''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_message_id ON messages(message_id)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_date ON messages(date)')
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=NORMAL')
+            conn.commit()
+
+            self.migrate_database(conn)
+
+            self.db_connections[channel] = conn
+
+        return self.db_connections[channel]
+
+    def migrate_database(self, conn: sqlite3.Connection):
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(messages)")
+        columns = {row[1] for row in cursor.fetchall()}
+
+        migrations = []
+        if 'post_author' not in columns:
+            migrations.append('ALTER TABLE messages ADD COLUMN post_author TEXT')
+        if 'views' not in columns:
+            migrations.append('ALTER TABLE messages ADD COLUMN views INTEGER')
+        if 'forwards' not in columns:
+            migrations.append('ALTER TABLE messages ADD COLUMN forwards INTEGER')
+        if 'reactions' not in columns:
+            migrations.append('ALTER TABLE messages ADD COLUMN reactions TEXT')
+
+        for migration in migrations:
+            try:
+                conn.execute(migration)
+            except:
+                pass
+
+        if migrations:
+            conn.commit()
+
+    def close_db_connections(self):
+        for conn in self.db_connections.values():
+            conn.close()
+        self.db_connections.clear()
+
+    def batch_insert_messages(self, channel: str, messages: List[MessageData]):
+        if not messages:
+            return
+
+        conn = self.get_db_connection(channel)
+        data = [(msg.message_id, msg.date, msg.sender_id, msg.first_name,
+                msg.last_name, msg.username, msg.message, msg.media_type,
+                msg.media_path, msg.reply_to, msg.post_author, msg.views,
+                msg.forwards, msg.reactions) for msg in messages]
+
+        conn.executemany('''INSERT OR IGNORE INTO messages
+                           (message_id, date, sender_id, first_name, last_name, username,
+                            message, media_type, media_path, reply_to, post_author, views,
+                            forwards, reactions)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', data)
+        conn.commit()
+
+    async def download_media(self, channel: str, message) -> Optional[str]:
+        if not message.media or not self.state['scrape_media']:
+            return None
+
+        if isinstance(message.media, MessageMediaWebPage):
+            return None
+
+        try:
+            channel_dir = self.get_media_root(channel) / channel
+            media_folder = channel_dir / 'media'
+            media_folder.mkdir(parents=True, exist_ok=True)
+            
+            if isinstance(message.media, MessageMediaPhoto):
+                media_subfolder = media_folder / 'photos'
+                original_name = getattr(message.file, 'name', None) or "photo.jpg"
+                ext = "jpg"
+            elif isinstance(message.media, MessageMediaDocument):
+                ext = getattr(message.file, 'ext', 'bin') if message.file else 'bin'
+                original_name = getattr(message.file, 'name', None) or f"document.{ext}"
+                mime_type = getattr(message.file, 'mime_type', '') if message.file else ''
+                if mime_type.startswith('video/'):
+                    media_subfolder = media_folder / 'videos'
+                else:
+                    media_subfolder = media_folder / 'documents'
+            else:
+                return None
+            
+            media_subfolder.mkdir(parents=True, exist_ok=True)
+            base_name = Path(original_name).stem
+            extension = Path(original_name).suffix or f".{ext}"
+            unique_filename = f"{message.id}-{base_name}{extension}"
+            media_path = media_subfolder / unique_filename
+            
+            existing_files = list(media_subfolder.glob(f"{message.id}-*"))
+            if existing_files:
+                return str(existing_files[0])
+
+            for attempt in range(3):
+                try:
+                    downloaded_path = await self.telegram_wait(
+                        "Download media",
+                        lambda: message.download_media(file=str(media_path)),
+                        item=f"message {message.id}"
+                    )
+                    if downloaded_path and Path(downloaded_path).exists():
+                        return downloaded_path
+                    else:
+                        return None
+                except Exception:
+                    if attempt < 2:
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        return None
+            
+            return None
+        except Exception:
+            return None
+
+    async def update_media_path(self, channel: str, message_id: int, media_path: str):
+        conn = self.get_db_connection(channel)
+        conn.execute('UPDATE messages SET media_path = ? WHERE message_id = ?', 
+                    (media_path, message_id))
+        conn.commit()
+
+    def should_forward_message(self, message, rule: ForwardingRule) -> bool:
+        if not rule.enabled:
+            return False
+        
+        if not message.media:
+            return rule.forward_text and bool(message.message)
+        
+        if isinstance(message.media, MessageMediaWebPage):
+            return rule.forward_text and bool(message.message)
+        
+        if isinstance(message.media, MessageMediaPhoto):
+            return rule.forward_images
+        
+        if isinstance(message.media, MessageMediaDocument):
+            if message.file:
+                mime_type = getattr(message.file, 'mime_type', '') or ''
+                if mime_type.startswith('video/'):
+                    return rule.forward_videos
+                else:
+                    return rule.forward_documents
+            return rule.forward_documents
+        
+        return False
+
+    async def forward_message(self, message, rule: ForwardingRule, source_channel_id: int = None):
+        try:
+            if rule.destination_channel.lstrip('-').isdigit():
+                dest_entity = await self.telegram_wait(
+                    "Forward destination entity",
+                    lambda: self.client.get_entity(PeerChannel(int(rule.destination_channel)))
+                )
+            else:
+                dest_entity = await self.telegram_wait(
+                    "Forward destination entity",
+                    lambda: self.client.get_entity(rule.destination_channel)
+                )
+            
+            if rule.forward_mode == "forward":
+                await self.telegram_wait(
+                    "Forward message",
+                    lambda: self.client.forward_messages(dest_entity, message),
+                    item=f"message {message.id}"
+                )
+                print(f"  Forwarded message {message.id}")
+            else:
+                source_name = self.state.get('channel_names', {}).get(rule.source_channel, '')
+                if source_channel_id:
+                    full_id = f"-100{abs(source_channel_id)}" if not str(source_channel_id).startswith('-100') else str(source_channel_id)
+                else:
+                    full_id = rule.source_channel
+                
+                if source_name and source_name != 'no_username':
+                    source_line = f"From: @{source_name} ({full_id})\n─────────────────\n"
+                else:
+                    source_line = f"From: {full_id}\n─────────────────\n"
+                
+                copy_text = source_line + (message.message or '')
+                
+                if message.media and not isinstance(message.media, MessageMediaWebPage):
+                                    await self.telegram_wait(
+                                        "Copy message with media",
+                                        lambda: self.client.send_message(
+                                            dest_entity,
+                                            copy_text,
+                                            file=message.media
+                                        ),
+                                        item=f"message {message.id}"
+                                    )
+                else:
+                                    await self.telegram_wait(
+                                        "Copy message text",
+                                        lambda: self.client.send_message(dest_entity, copy_text),
+                                        item=f"message {message.id}"
+                                    )
+                print(f"  Copied message {message.id}")
+                
+            return True
+        except FloodWaitError as e:
+            print(f"  Rate limited, waiting {e.seconds}s...")
+            await asyncio.sleep(e.seconds)
+            return await self.forward_message(message, rule, source_channel_id)
+        except Exception as e:
+            print(f"  Failed to forward message {message.id}: {e}")
+            return False
+
+    async def setup_forwarding_handler(self):
+        rules = self.get_forwarding_rules()
+        if not rules:
+            print("No forwarding rules configured")
+            return False
+        
+        enabled_rules = [r for r in rules if r.enabled]
+        if not enabled_rules:
+            print("No enabled forwarding rules")
+            return False
+        
+        source_channels = []
+        source_id_map = {}
+        for rule in enabled_rules:
+            try:
+                if rule.source_channel.lstrip('-').isdigit():
+                    channel_id = int(rule.source_channel)
+                else:
+                    entity = await self.telegram_wait(
+                        "Forwarding source entity",
+                        lambda: self.client.get_entity(rule.source_channel)
+                    )
+                    channel_id = entity.id
+                source_channels.append(channel_id)
+                source_id_map[channel_id] = rule.source_channel
+            except Exception as e:
+                print(f"Failed to get entity for {rule.source_channel}: {e}")
+        
+        if not source_channels:
+            print("No valid source channels")
+            return False
+        
+        @self.client.on(events.NewMessage(chats=source_channels, incoming=True, outgoing=True))
+        async def forwarding_handler(event):
+            message = event.message
+            chat_id = event.chat_id
+            
+            for rule in enabled_rules:
+                rule_source_id = None
+                if rule.source_channel.lstrip('-').isdigit():
+                    rule_source_id = int(rule.source_channel)
+                else:
+                    rule_source_id = next((k for k, v in source_id_map.items() if v == rule.source_channel), None)
+                
+                if rule_source_id == chat_id:
+                    if self.should_forward_message(message, rule):
+                        source_name = self.state.get('channel_names', {}).get(rule.source_channel, rule.source_channel)
+                        dest_name = self.state.get('channel_names', {}).get(rule.destination_channel, rule.destination_channel)
+                        print(f"\n[{time.strftime('%H:%M:%S')}] New message in {source_name} -> forwarding to {dest_name}")
+                        await self.forward_message(message, rule, chat_id)
+        
+        self.forwarding_handler = forwarding_handler
+        return True
+
+    async def ensure_client_connected(self, context: str, retry_delay: int = 5) -> bool:
+        if not self.client:
+            return False
+
+        while self.continuous_scraping_active or self.forwarding_active:
+            if self.client.is_connected():
+                return True
+
+            try:
+                print(f"\n{context}: reconnecting to Telegram...")
+                await self.client.connect()
+                return True
+            except Exception as e:
+                print(f"\n{context}: reconnect failed: {e}")
+                await asyncio.sleep(retry_delay)
+
+        return False
+
+    async def telegram_wait(self, context: str, operation, item: Optional[str] = None, retry_delay: int = 5):
+        label = f"{context} ({item})" if item else context
+        while True:
+            try:
+                return await operation()
+            except FloodWaitError as e:
+                seconds = max(1, int(e.seconds))
+                await self.wait_with_countdown(label, seconds)
+            except Exception:
+                raise
+
+    async def wait_with_countdown(self, label: str, seconds: int):
+        seconds = max(1, int(seconds))
+        print(f"\n⏳ {label}: Telegram asked to wait {seconds}s.")
+        for remaining in range(seconds, 0, -1):
+            sys.stdout.write(f"\r⏳ {label}: waiting {remaining}s...   ")
+            sys.stdout.flush()
+            await asyncio.sleep(1)
+        sys.stdout.write(f"\r⏳ {label}: wait complete.         \n")
+        sys.stdout.flush()
+
+    async def start_forwarding(self):
+        self.forwarding_active = True
+        
+        if not await self.setup_forwarding_handler():
+            self.forwarding_active = False
+            return
+        
+        rules = self.get_forwarding_rules()
+        enabled_rules = [r for r in rules if r.enabled]
+        
+        print(f"\nForwarding service started!")
+        print(f"   Monitoring {len(enabled_rules)} rule(s)")
+        print("   Press Ctrl+C to stop\n")
+        
+        for rule in enabled_rules:
+            source_name = self.state.get('channel_names', {}).get(rule.source_channel, rule.source_channel)
+            dest_name = self.state.get('channel_names', {}).get(rule.destination_channel, rule.destination_channel)
+            content_types = []
+            if rule.forward_text: content_types.append("text")
+            if rule.forward_images: content_types.append("images")
+            if rule.forward_videos: content_types.append("videos")
+            if rule.forward_documents: content_types.append("documents")
+            print(f"   - {source_name} -> {dest_name}")
+            print(f"     Mode: {rule.forward_mode} | Content: {', '.join(content_types)}")
+        
+        print("\nWatching for new messages...\n")
+        
+        try:
+            while self.forwarding_active:
+                if not await self.ensure_client_connected("Forwarding service"):
+                    break
+
+                try:
+                    await self.client.run_until_disconnected()
+                except asyncio.CancelledError:
+                    raise
+                except ConnectionError:
+                    if self.forwarding_active:
+                        print("\nConnection lost. Reconnecting forwarding service...")
+                        await asyncio.sleep(5)
+                except Exception as e:
+                    if self.forwarding_active:
+                        print(f"\nForwarding stopped unexpectedly: {e}")
+                        await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.forwarding_active = False
+            print("\nForwarding service stopped")
+
+    async def manage_forwarding_rules(self):
+        while True:
+            print("\n" + "="*45)
+            print("         FORWARDING RULES MANAGER")
+            print("="*45)
+            
+            rules = self.get_forwarding_rules()
+            if rules:
+                print("\nCurrent Rules:")
+                for i, rule in enumerate(rules, 1):
+                    source_name = self.state.get('channel_names', {}).get(rule.source_channel, rule.source_channel)
+                    dest_name = self.state.get('channel_names', {}).get(rule.destination_channel, rule.destination_channel)
+                    status = "✅" if rule.enabled else "❌"
+                    content_types = []
+                    if rule.forward_text: content_types.append("T")
+                    if rule.forward_images: content_types.append("I")
+                    if rule.forward_videos: content_types.append("V")
+                    if rule.forward_documents: content_types.append("D")
+                    print(f"  [{i}] {status} {source_name} → {dest_name}")
+                    print(f"      Mode: {rule.forward_mode} | Content: {'/'.join(content_types)}")
+            else:
+                print("\nNo forwarding rules configured")
+            
+            print("\n[A] Add new rule")
+            print("[E] Edit rule")
+            print("[T] Toggle rule on/off")
+            print("[D] Delete rule")
+            print("[S] Start forwarding")
+            print("[H] Backfill historical messages")
+            print("[B] Back to main menu")
+            print("="*45)
+            
+            choice = input("Enter your choice: ").lower().strip()
+            
+            if choice == 'a':
+                await self.add_forwarding_rule_interactive()
+            elif choice == 'e':
+                await self.edit_forwarding_rule_interactive()
+            elif choice == 't':
+                await self.toggle_forwarding_rule()
+            elif choice == 'd':
+                await self.delete_forwarding_rule_interactive()
+            elif choice == 's':
+                if not rules or not any(r.enabled for r in rules):
+                    print("❌ No enabled forwarding rules. Add or enable rules first.")
+                    continue
+                try:
+                    await self.start_forwarding()
+                except KeyboardInterrupt:
+                    self.forwarding_active = False
+                    print("\nForwarding stopped")
+            elif choice == 'h':
+                await self.backfill_forwarding_interactive()
+            elif choice == 'b':
+                break
+            else:
+                print("Invalid option")
+
+    async def add_forwarding_rule_interactive(self):
+        print("\n📝 ADD NEW FORWARDING RULE")
+        print("-" * 40)
+        
+        await self.view_channels()
+        
+        if not self.state['channels']:
+            print("\n❌ No channels available. Add channels first using [L] in the main menu.")
+            return
+        
+        channels_list = list(self.state['channels'].keys())
+        
+        print("\n1️⃣ Select SOURCE channel (messages will be forwarded FROM here):")
+        source_input = input("Enter channel number or ID: ").strip()
+        source_channels = self.parse_channel_selection(source_input)
+        
+        if not source_channels:
+            print("❌ Invalid source channel selection")
+            return
+        source_channel = source_channels[0]
+        
+        print("\n2️⃣ Select DESTINATION channel (messages will be forwarded TO here):")
+        print("   You can enter a channel number from the list, or a channel username (@channelname)")
+        dest_input = input("Enter channel number, ID, or @username: ").strip()
+        
+        if dest_input.startswith('@'):
+            dest_channel = dest_input
+        else:
+            # First try parsing as a channel from the tracked list
+            dest_channels = self.parse_channel_selection(dest_input)
+            if dest_channels:
+                dest_channel = dest_channels[0]
+            else:
+                # If not in tracked list, try as a raw channel ID (for destination-only channels)
+                try:
+                    if dest_input.lstrip('-').isdigit():
+                        test_id = int(dest_input)
+                        # Try to resolve the channel via Telethon to verify it exists
+                        try:
+                            entity = await self.client.get_entity(PeerChannel(test_id))
+                            dest_channel = dest_input
+                            print(f"✅ Found channel: {getattr(entity, 'title', dest_input)}")
+                        except Exception:
+                            print(f"❌ Could not access channel ID {dest_input}. Make sure this account is a member.")
+                            return
+                    else:
+                        print("❌ Invalid destination channel selection")
+                        return
+                except ValueError:
+                    print("❌ Invalid destination channel selection")
+                    return
+        
+        print("\n3️⃣ Select content types to forward:")
+        print("   [1] Text messages")
+        print("   [2] Images/Photos")
+        print("   [3] Videos")
+        print("   [4] Documents/Files")
+        print("   [A] All types")
+        print("   Example: 1,2,3 or A for all")
+        
+        content_input = input("Enter selection: ").strip().lower()
+        
+        if content_input == 'a':
+            forward_text = forward_images = forward_videos = forward_documents = True
+        else:
+            selections = [x.strip() for x in content_input.split(',')]
+            forward_text = '1' in selections
+            forward_images = '2' in selections
+            forward_videos = '3' in selections
+            forward_documents = '4' in selections
+        
+        if not any([forward_text, forward_images, forward_videos, forward_documents]):
+            print("❌ You must select at least one content type")
+            return
+        
+        print("\n4️⃣ Select forwarding mode:")
+        print("   [1] Copy - Send as new message (no 'Forwarded from' header)")
+        print("   [2] Forward - Keep 'Forwarded from' header")
+        
+        mode_input = input("Enter 1 or 2: ").strip()
+        forward_mode = "forward" if mode_input == '2' else "copy"
+        
+        rule = ForwardingRule(
+            source_channel=source_channel,
+            destination_channel=dest_channel,
+            forward_text=forward_text,
+            forward_images=forward_images,
+            forward_videos=forward_videos,
+            forward_documents=forward_documents,
+            forward_mode=forward_mode,
+            enabled=True
+        )
+        
+        self.save_forwarding_rule(rule)
+        
+        source_name = self.state.get('channel_names', {}).get(source_channel, source_channel)
+        dest_name = dest_channel if dest_channel.startswith('@') else self.state.get('channel_names', {}).get(dest_channel, dest_channel)
+        
+        print(f"\n✅ Forwarding rule created!")
+        print(f"   {source_name} → {dest_name}")
+        content_types = []
+        if forward_text: content_types.append("text")
+        if forward_images: content_types.append("images")
+        if forward_videos: content_types.append("videos")
+        if forward_documents: content_types.append("documents")
+        print(f"   Content: {', '.join(content_types)}")
+        print(f"   Mode: {forward_mode}")
+
+    async def edit_forwarding_rule_interactive(self):
+        rules = self.get_forwarding_rules()
+        if not rules:
+            print("No rules to edit")
+            return
+        
+        try:
+            idx = int(input("Enter rule number to edit: ")) - 1
+            if not (0 <= idx < len(rules)):
+                print("Invalid rule number")
+                return
+        except ValueError:
+            print("Invalid input")
+            return
+        
+        rule = rules[idx]
+        
+        print(f"\nEditing rule {idx + 1}:")
+        print("Press Enter to keep current value\n")
+        
+        print("Current content types:")
+        print(f"  Text: {'Yes' if rule.forward_text else 'No'}")
+        print(f"  Images: {'Yes' if rule.forward_images else 'No'}")
+        print(f"  Videos: {'Yes' if rule.forward_videos else 'No'}")
+        print(f"  Documents: {'Yes' if rule.forward_documents else 'No'}")
+        
+        update_content = input("\nUpdate content types? (y/n): ").lower().strip()
+        if update_content == 'y':
+            print("Enter 1,2,3,4 or A for all:")
+            print("   [1] Text  [2] Images  [3] Videos  [4] Documents")
+            content_input = input("Selection: ").strip().lower()
+            
+            if content_input == 'a':
+                rule.forward_text = rule.forward_images = rule.forward_videos = rule.forward_documents = True
+            elif content_input:
+                selections = [x.strip() for x in content_input.split(',')]
+                rule.forward_text = '1' in selections
+                rule.forward_images = '2' in selections
+                rule.forward_videos = '3' in selections
+                rule.forward_documents = '4' in selections
+        
+        print(f"\nCurrent mode: {rule.forward_mode}")
+        print("   [1] Copy  [2] Forward")
+        mode_input = input("New mode (or Enter to keep): ").strip()
+        if mode_input == '1':
+            rule.forward_mode = 'copy'
+        elif mode_input == '2':
+            rule.forward_mode = 'forward'
+        
+        self.save_forwarding_rule(rule)
+        print("✅ Rule updated!")
+
+    async def toggle_forwarding_rule(self):
+        rules = self.get_forwarding_rules()
+        if not rules:
+            print("No rules to toggle")
+            return
+        
+        try:
+            idx = int(input("Enter rule number to toggle: ")) - 1
+            if not (0 <= idx < len(rules)):
+                print("Invalid rule number")
+                return
+        except ValueError:
+            print("Invalid input")
+            return
+        
+        rule = rules[idx]
+        rule.enabled = not rule.enabled
+        self.save_forwarding_rule(rule)
+        
+        status = "enabled" if rule.enabled else "disabled"
+        print(f"✅ Rule {idx + 1} {status}")
+
+    async def delete_forwarding_rule_interactive(self):
+        rules = self.get_forwarding_rules()
+        if not rules:
+            print("No rules to delete")
+            return
+        
+        try:
+            idx = int(input("Enter rule number to delete: ")) - 1
+            if not (0 <= idx < len(rules)):
+                print("Invalid rule number")
+                return
+        except ValueError:
+            print("Invalid input")
+            return
+        
+        confirm = input(f"Delete rule {idx + 1}? (y/n): ").lower().strip()
+        if confirm == 'y':
+            if self.remove_forwarding_rule(idx):
+                print("✅ Rule deleted")
+            else:
+                print("❌ Failed to delete rule")
+
+    async def backfill_forwarding_interactive(self):
+        rules = self.get_forwarding_rules()
+        if not rules:
+            print("No forwarding rules configured. Add a rule first.")
+            return
+        
+        print("\n" + "="*45)
+        print("         BACKFILL FORWARDING")
+        print("="*45)
+        print("\nThis will forward historical messages from your")
+        print("scraped database through an existing forwarding rule.\n")
+        
+        for i, rule in enumerate(rules, 1):
+            source_name = self.state.get('channel_names', {}).get(rule.source_channel, rule.source_channel)
+            dest_name = self.state.get('channel_names', {}).get(rule.destination_channel, rule.destination_channel)
+            status = "✅" if rule.enabled else "❌"
+            content_types = []
+            if rule.forward_text: content_types.append("T")
+            if rule.forward_images: content_types.append("I")
+            if rule.forward_videos: content_types.append("V")
+            if rule.forward_documents: content_types.append("D")
+            print(f"  [{i}] {status} {source_name} → {dest_name}")
+            print(f"      Mode: {rule.forward_mode} | Content: {'/'.join(content_types)}")
+        
+        try:
+            idx = int(input("\nSelect rule number to backfill: ")) - 1
+            if not (0 <= idx < len(rules)):
+                print("Invalid rule number")
+                return
+        except ValueError:
+            print("Invalid input")
+            return
+        
+        rule = rules[idx]
+        source_channel = rule.source_channel
+        
+        # Check that we have scraped data for the source channel
+        if source_channel not in self.state['channels']:
+            print(f"❌ No scraped data for source channel {source_channel}")
+            print("   Scrape this channel first, then backfill.")
+            return
+        
+        conn = self.get_db_connection(source_channel)
+        cursor = conn.cursor()
+        
+        # Show date range of available data
+        cursor.execute('SELECT MIN(date), MAX(date), COUNT(*) FROM messages')
+        row = cursor.fetchone()
+        if not row or row[2] == 0:
+            print(f"❌ No messages in database for this channel. Scrape first.")
+            return
+        
+        min_date, max_date, total_count = row
+        print(f"\n📊 Available data:")
+        print(f"   Date range: {min_date} → {max_date}")
+        print(f"   Total messages: {total_count}")
+        
+        # Date range filter
+        print(f"\n📅 Enter date range to backfill (YYYY-MM-DD format)")
+        print(f"   Press Enter to use the full range")
+        
+        start_input = input(f"   Start date [{min_date[:10]}]: ").strip()
+        start_date = start_input if start_input else min_date[:10]
+        
+        end_input = input(f"   End date   [{max_date[:10]}]: ").strip()
+        end_date = end_input if end_input else max_date[:10]
+        
+        # Validate dates
+        try:
+            from datetime import datetime
+            datetime.strptime(start_date, '%Y-%m-%d')
+            datetime.strptime(end_date, '%Y-%m-%d')
+        except ValueError:
+            print("❌ Invalid date format. Use YYYY-MM-DD")
+            return
+        
+        # Count matching messages
+        cursor.execute('''SELECT COUNT(*) FROM messages 
+                         WHERE date >= ? AND date < date(?, '+1 day')''',
+                       (start_date, end_date))
+        match_count = cursor.fetchone()[0]
+        
+        if match_count == 0:
+            print("❌ No messages found in that date range")
+            return
+        
+        # Rate limit configuration
+        print(f"\n⚡ Rate limiting:")
+        print(f"   Delay between messages (seconds). Higher = safer from bans.")
+        print(f"   Recommended: 1-3 for small batches, 3-5 for large ones.")
+        delay_input = input(f"   Delay [{2 if match_count < 500 else 4}s]: ").strip()
+        try:
+            delay = float(delay_input) if delay_input else (2 if match_count < 500 else 4)
+            delay = max(0.5, delay)  # Floor at 0.5s
+        except ValueError:
+            delay = 2
+        
+        source_name = self.state.get('channel_names', {}).get(rule.source_channel, rule.source_channel)
+        dest_name = self.state.get('channel_names', {}).get(rule.destination_channel, rule.destination_channel)
+        
+        print(f"\n{'='*45}")
+        print(f"  Rule:     {source_name} → {dest_name}")
+        print(f"  Range:    {start_date} → {end_date}")
+        print(f"  Messages: {match_count}")
+        print(f"  Delay:    {delay}s per message")
+        est_minutes = (match_count * delay) / 60
+        print(f"  Est time: ~{est_minutes:.1f} minutes")
+        print(f"{'='*45}")
+        
+        confirm = input("\nProceed with backfill? (y/n): ").lower().strip()
+        if confirm != 'y':
+            print("Backfill cancelled")
+            return
+        
+        await self.run_backfill(rule, source_channel, start_date, end_date, delay)
+
+    async def run_backfill(self, rule: ForwardingRule, source_channel: str, 
+                           start_date: str, end_date: str, delay: float):
+        conn = self.get_db_connection(source_channel)
+        cursor = conn.cursor()
+        
+        # Determine which messages to forward based on rule content type filters
+        conditions = ["date >= ?", "date < date(?, '+1 day')"]
+        params = [start_date, end_date]
+        
+        media_conditions = []
+        if rule.forward_text:
+            media_conditions.append("(media_type IS NULL AND message != '')")
+            media_conditions.append("(media_type = 'MessageMediaWebPage' AND message != '')")
+        if rule.forward_images:
+            media_conditions.append("media_type = 'MessageMediaPhoto'")
+        if rule.forward_videos:
+            media_conditions.append("(media_type = 'MessageMediaDocument' AND media_path LIKE '%.mp4')")
+            media_conditions.append("(media_type = 'MessageMediaDocument' AND media_path LIKE '%.mov')")
+            media_conditions.append("(media_type = 'MessageMediaDocument' AND media_path LIKE '%.avi')")
+            media_conditions.append("(media_type = 'MessageMediaDocument' AND media_path LIKE '%.mkv')")
+            media_conditions.append("(media_type = 'MessageMediaDocument' AND media_path LIKE '%.webm')")
+        if rule.forward_documents:
+            if not rule.forward_videos:
+                media_conditions.append("(media_type = 'MessageMediaDocument')")
+            else:
+                # Documents but exclude videos already matched above
+                media_conditions.append("(media_type = 'MessageMediaDocument' AND (media_path IS NULL OR (media_path NOT LIKE '%.mp4' AND media_path NOT LIKE '%.mov' AND media_path NOT LIKE '%.avi' AND media_path NOT LIKE '%.mkv' AND media_path NOT LIKE '%.webm')))")
+        
+        if not media_conditions:
+            print("❌ Rule has no content types enabled")
+            return
+        
+        conditions.append(f"({' OR '.join(media_conditions)})")
+        
+        query = f"SELECT message_id FROM messages WHERE {' AND '.join(conditions)} ORDER BY date ASC"
+        cursor.execute(query, params)
+        message_ids = [row[0] for row in cursor.fetchall()]
+        
+        if not message_ids:
+            print("❌ No matching messages found for this rule's content filters")
+            return
+        
+        total = len(message_ids)
+        print(f"\n🚀 Starting backfill of {total} messages...")
+        
+        # Get the source entity for fetching full messages from Telegram
+        try:
+            if source_channel.lstrip('-').isdigit():
+                entity = await self.telegram_wait(
+                    "Backfill source entity",
+                    lambda: self.client.get_entity(PeerChannel(int(source_channel)))
+                )
+            else:
+                entity = await self.telegram_wait(
+                    "Backfill source entity",
+                    lambda: self.client.get_entity(source_channel)
+                )
+        except Exception as e:
+            print(f"❌ Failed to get source channel entity: {e}")
+            return
+        
+        forwarded = 0
+        failed = 0
+        skipped = 0
+        
+        # Process in batches to avoid holding too many messages in memory
+        batch_size = 20
+        for i in range(0, total, batch_size):
+            batch_ids = message_ids[i:i + batch_size]
+            
+            try:
+                messages = await self.telegram_wait(
+                    "Backfill batch",
+                    lambda: self.client.get_messages(entity, ids=batch_ids),
+                    item=f"message ids {batch_ids[0]}..{batch_ids[-1]}"
+                )
+            except Exception as e:
+                print(f"\n❌ Failed to fetch batch: {e}")
+                failed += len(batch_ids)
+                continue
+            
+            for msg in messages:
+                if not msg:
+                    skipped += 1
+                    continue
+                
+                try:
+                    success = await self.forward_message(msg, rule, int(source_channel) if source_channel.lstrip('-').isdigit() else None)
+                    if success:
+                        forwarded += 1
+                    else:
+                        failed += 1
+                except Exception as e:
+                    failed += 1
+                
+                # Progress bar
+                done = forwarded + failed + skipped
+                progress = (done / total) * 100
+                bar_length = 30
+                filled_length = int(bar_length * done // total)
+                bar = '█' * filled_length + '░' * (bar_length - filled_length)
+                sys.stdout.write(f"\r📤 Backfill: [{bar}] {progress:.1f}% ({done}/{total}) | ✅{forwarded} ❌{failed} ⏭{skipped}")
+                sys.stdout.flush()
+                
+                # Rate limit delay
+                await asyncio.sleep(delay)
+        
+        print(f"\n\n{'='*45}")
+        print(f"  BACKFILL COMPLETE")
+        print(f"  Forwarded: {forwarded}")
+        print(f"  Failed:    {failed}")
+        print(f"  Skipped:   {skipped} (deleted messages)")
+        print(f"{'='*45}")
+
+    async def scrape_channel(self, channel: str, offset_id: int):
+        try:
+            if not self.client.is_connected():
+                await self.client.connect()
+            
+            entity = await self.telegram_wait(
+                "Scrape channel entity",
+                lambda: self.client.get_entity(PeerChannel(int(channel)) if channel.startswith('-') else channel)
+            )
+            result = await self.telegram_wait(
+                "Scrape channel count",
+                lambda: self.client.get_messages(entity, offset_id=offset_id, reverse=True, limit=0)
+            )
+            total_messages = result.total
+
+            if total_messages == 0:
+                print(f"No messages found in channel {channel}")
+                return
+
+            print(f"Found {total_messages} messages in channel {channel}")
+
+            message_batch = []
+            media_tasks = []
+            processed_messages = 0
+            last_message_id = offset_id
+            semaphore = asyncio.Semaphore(self.max_concurrent_downloads)
+
+            scrape_offset = offset_id
+            while True:
+                try:
+                    async for message in self.client.iter_messages(entity, offset_id=scrape_offset, reverse=True):
+                        try:
+                            sender = await self.telegram_wait(
+                                "Fetch sender",
+                                lambda: message.get_sender(),
+                                item=f"message {message.id}"
+                            )
+
+                            reactions_str = None
+                            if message.reactions and message.reactions.results:
+                                reactions_parts = []
+                                for reaction in message.reactions.results:
+                                    emoji = getattr(reaction.reaction, 'emoticon', '')
+                                    count = reaction.count
+                                    if emoji:
+                                        reactions_parts.append(f"{emoji} {count}")
+                                if reactions_parts:
+                                    reactions_str = ' '.join(reactions_parts)
+
+                            msg_data = MessageData(
+                                message_id=message.id,
+                                date=message.date.strftime('%Y-%m-%d %H:%M:%S'),
+                                sender_id=message.sender_id,
+                                first_name=getattr(sender, 'first_name', None) if isinstance(sender, User) else None,
+                                last_name=getattr(sender, 'last_name', None) if isinstance(sender, User) else None,
+                                username=getattr(sender, 'username', None) if isinstance(sender, User) else None,
+                                message=message.message or '',
+                                media_type=message.media.__class__.__name__ if message.media else None,
+                                media_path=None,
+                                reply_to=message.reply_to_msg_id if message.reply_to else None,
+                                post_author=message.post_author,
+                                views=message.views,
+                                forwards=message.forwards,
+                                reactions=reactions_str
+                            )
+
+                            message_batch.append(msg_data)
+
+                            if self.state['scrape_media'] and message.media and not isinstance(message.media, MessageMediaWebPage):
+                                media_tasks.append(message)
+
+                            last_message_id = message.id
+                            processed_messages += 1
+
+                            if len(message_batch) >= self.batch_size:
+                                self.batch_insert_messages(channel, message_batch)
+                                message_batch.clear()
+
+                            if processed_messages % self.state_save_interval == 0:
+                                self.state['channels'][channel] = last_message_id
+                                self.save_state()
+
+                            progress = (processed_messages / total_messages) * 100
+                            bar_length = 30
+                            filled_length = int(bar_length * processed_messages // total_messages)
+                            bar = '█' * filled_length + '░' * (bar_length - filled_length)
+                            
+                            sys.stdout.write(f"\r📄 Messages: [{bar}] {progress:.1f}% ({processed_messages}/{total_messages})")
+                            sys.stdout.flush()
+
+                        except Exception as e:
+                            print(f"\nError processing message {message.id}: {e}")
+                    break
+                except FloodWaitError as e:
+                    await self.wait_with_countdown(f"Scrape channel {channel}", e.seconds)
+                    scrape_offset = last_message_id
+                    continue
+
+            if message_batch:
+                self.batch_insert_messages(channel, message_batch)
+
+            if media_tasks:
+                total_media = len(media_tasks)
+                completed_media = 0
+                successful_downloads = 0
+                print(f"\n📥 Downloading {total_media} media files...")
+                
+                semaphore = asyncio.Semaphore(self.max_concurrent_downloads)
+                
+                async def download_single_media(message):
+                    async with semaphore:
+                        return await self.download_media(channel, message)
+                
+                batch_size = 10
+                for i in range(0, len(media_tasks), batch_size):
+                    batch = media_tasks[i:i + batch_size]
+                    tasks = [asyncio.create_task(download_single_media(msg)) for msg in batch]
+                    
+                    for j, task in enumerate(tasks):
+                        try:
+                            media_path = await task
+                            if media_path:
+                                await self.update_media_path(channel, batch[j].id, media_path)
+                                successful_downloads += 1
+                        except Exception:
+                            pass
+                        
+                        completed_media += 1
+                        progress = (completed_media / total_media) * 100
+                        bar_length = 30
+                        filled_length = int(bar_length * completed_media // total_media)
+                        bar = '█' * filled_length + '░' * (bar_length - filled_length)
+                        
+                        sys.stdout.write(f"\r📥 Media: [{bar}] {progress:.1f}% ({completed_media}/{total_media})")
+                        sys.stdout.flush()
+                
+                print(f"\n✅ Media download complete! ({successful_downloads}/{total_media} successful)")
+
+            self.state['channels'][channel] = last_message_id
+            self.save_state()
+            print(f"\nCompleted scraping channel {channel}")
+
+        except Exception as e:
+            print(f"Error with channel {channel}: {e}")
+
+    async def rescrape_media(self, channel: str):
+        conn = self.get_db_connection(channel)
+        cursor = conn.cursor()
+        cursor.execute('SELECT message_id FROM messages WHERE media_type IS NOT NULL AND media_type != "MessageMediaWebPage" AND media_path IS NULL')
+        message_ids = [row[0] for row in cursor.fetchall()]
+
+        channel_name = self.state.get('channel_names', {}).get(channel, 'Unknown')
+
+        if not message_ids:
+            print(f"No media files to reprocess for {channel_name} (ID: {channel})")
+            return
+
+        print(f"📥 Reprocessing {len(message_ids)} media files for {channel_name} (ID: {channel})")
+
+        try:
+            if channel.lstrip('-').isdigit():
+                entity = await self.telegram_wait(
+                    "Rescrape entity",
+                    lambda: self.client.get_entity(PeerChannel(int(channel)))
+                )
+            else:
+                entity = await self.telegram_wait(
+                    "Rescrape entity",
+                    lambda: self.client.get_entity(channel)
+                )
+            semaphore = asyncio.Semaphore(self.max_concurrent_downloads)
+            completed_media = 0
+            successful_downloads = 0
+            
+            async def download_single_media(message):
+                async with semaphore:
+                    return await self.download_media(channel, message)
+
+            batch_size = 10
+            for i in range(0, len(message_ids), batch_size):
+                batch_ids = message_ids[i:i + batch_size]
+                messages = await self.telegram_wait(
+                    "Rescrape batch",
+                    lambda: self.client.get_messages(entity, ids=batch_ids),
+                    item=f"message ids {batch_ids[0]}..{batch_ids[-1]}"
+                )
+                
+                valid_messages = [msg for msg in messages if msg and msg.media and not isinstance(msg.media, MessageMediaWebPage)]
+                tasks = [asyncio.create_task(download_single_media(msg)) for msg in valid_messages]
+
+                for j, task in enumerate(tasks):
+                    try:
+                        media_path = await task
+                        if media_path:
+                            await self.update_media_path(channel, valid_messages[j].id, media_path)
+                            successful_downloads += 1
+                    except Exception:
+                        pass
+                    
+                    completed_media += 1
+                    progress = (completed_media / len(message_ids)) * 100
+                    bar_length = 30
+                    filled_length = int(bar_length * completed_media // len(message_ids))
+                    bar = '█' * filled_length + '░' * (bar_length - filled_length)
+                    
+                    sys.stdout.write(f"\r🔄 Rescrape: [{bar}] {progress:.1f}% ({completed_media}/{len(message_ids)})")
+                    sys.stdout.flush()
+
+            print(f"\n✅ Media reprocessing complete! ({successful_downloads}/{len(message_ids)} successful)")
+
+        except Exception as e:
+            print(f"Error reprocessing media: {e}")
+
+    async def fix_missing_media(self, channel: str):
+        conn = self.get_db_connection(channel)
+        cursor = conn.cursor()
+
+        cursor.execute('SELECT COUNT(*) FROM messages WHERE media_type IS NOT NULL AND media_type != "MessageMediaWebPage"')
+        total_with_media = cursor.fetchone()[0]
+
+        cursor.execute('SELECT COUNT(*) FROM messages WHERE media_type IS NOT NULL AND media_type != "MessageMediaWebPage" AND media_path IS NOT NULL')
+        total_with_files = cursor.fetchone()[0]
+
+        missing_count = total_with_media - total_with_files
+
+        channel_name = self.state.get('channel_names', {}).get(channel, 'Unknown')
+        print(f"\n📊 Media Analysis for {channel_name} (ID: {channel}):")
+        print(f"Messages with media: {total_with_media}")
+        print(f"Media files downloaded: {total_with_files}")
+        print(f"Missing media files: {missing_count}")
+
+        if missing_count == 0:
+            print("✅ All media files are already downloaded!")
+            return
+
+        cursor.execute('SELECT message_id, media_type FROM messages WHERE media_type IS NOT NULL AND media_type != "MessageMediaWebPage" AND (media_path IS NULL OR media_path = "")')
+        missing_media = cursor.fetchall()
+
+        if not missing_media:
+            print("✅ No missing media found!")
+            return
+
+        print(f"\n🔧 Attempting to download {len(missing_media)} missing media files...")
+
+        try:
+            if channel.lstrip('-').isdigit():
+                entity = await self.telegram_wait(
+                    "Fix missing media entity",
+                    lambda: self.client.get_entity(PeerChannel(int(channel)))
+                )
+            else:
+                entity = await self.telegram_wait(
+                    "Fix missing media entity",
+                    lambda: self.client.get_entity(channel)
+                )
+            semaphore = asyncio.Semaphore(self.max_concurrent_downloads)
+            completed_media = 0
+            successful_downloads = 0
+            
+            async def download_single_media(message):
+                async with semaphore:
+                    return await self.download_media(channel, message)
+            
+            batch_size = 10
+            for i in range(0, len(missing_media), batch_size):
+                batch = missing_media[i:i + batch_size]
+                message_ids = [msg[0] for msg in batch]
+                
+                messages = await self.telegram_wait(
+                    "Fix missing media batch",
+                    lambda: self.client.get_messages(entity, ids=message_ids),
+                    item=f"message ids {message_ids[0]}..{message_ids[-1]}"
+                )
+                valid_messages = [msg for msg in messages if msg and msg.media and not isinstance(msg.media, MessageMediaWebPage)]
+                
+                tasks = [asyncio.create_task(download_single_media(msg)) for msg in valid_messages]
+
+                for j, task in enumerate(tasks):
+                    try:
+                        media_path = await task
+                        if media_path:
+                            await self.update_media_path(channel, valid_messages[j].id, media_path)
+                            successful_downloads += 1
+                    except Exception:
+                        pass
+                    
+                    completed_media += 1
+                    progress = (completed_media / len(missing_media)) * 100
+                    bar_length = 30
+                    filled_length = int(bar_length * completed_media // len(missing_media))
+                    bar = '█' * filled_length + '░' * (bar_length - filled_length)
+                    
+                    sys.stdout.write(f"\r🔧 Fix Media: [{bar}] {progress:.1f}% ({completed_media}/{len(missing_media)})")
+                    sys.stdout.flush()
+
+            print(f"\n✅ Media fix complete! ({successful_downloads}/{len(missing_media)} successful)")
+
+        except Exception as e:
+            print(f"Error fixing missing media: {e}")
+
+    async def continuous_scraping(self):
+        self.continuous_scraping_active = True
+        
+        try:
+            while self.continuous_scraping_active:
+                if not await self.ensure_client_connected("Continuous scraping"):
+                    break
+
+                start_time = time.time()
+                
+                for channel in list(self.state['channels'].keys()):
+                    if not self.continuous_scraping_active:
+                        break
+                    if not await self.ensure_client_connected(f"Continuous scraping ({channel})"):
+                        break
+                    print(f"\nChecking for new messages in channel: {channel}")
+                    await self.scrape_channel(channel, self.state['channels'][channel])
+                
+                elapsed = time.time() - start_time
+                sleep_time = max(0, 60 - elapsed)
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
+                    
+        except asyncio.CancelledError:
+            print("Continuous scraping stopped")
+        except Exception as e:
+            if self.continuous_scraping_active:
+                print(f"Continuous scraping stopped unexpectedly: {e}")
+        finally:
+            self.continuous_scraping_active = False
+
+    async def continuous_scraping_with_forwarding(self):
+        self.continuous_scraping_active = True
+        self.forwarding_active = True
+        
+        if not self.client.is_connected():
+            await self.client.connect()
+        
+        rules = self.get_forwarding_rules()
+        enabled_rules = [r for r in rules if r.enabled]
+        forwarding_enabled = False
+        
+        if enabled_rules:
+            forwarding_enabled = await self.setup_forwarding_handler()
+        
+        print("\n" + "="*50)
+        print("     CONTINUOUS SCRAPING + FORWARDING SERVICE")
+        print("="*50)
+        
+        if self.state['channels']:
+            print(f"\nScraping {len(self.state['channels'])} channel(s) every 60 seconds")
+            for channel in self.state['channels']:
+                channel_name = self.state.get('channel_names', {}).get(channel, 'Unknown')
+                print(f"   - {channel_name} ({channel})")
+        else:
+            print("\nNo channels configured for scraping")
+        
+        if forwarding_enabled:
+            print(f"\nForwarding {len(enabled_rules)} rule(s):")
+            for rule in enabled_rules:
+                source_name = self.state.get('channel_names', {}).get(rule.source_channel, rule.source_channel)
+                dest_name = self.state.get('channel_names', {}).get(rule.destination_channel, rule.destination_channel)
+                content_types = []
+                if rule.forward_text: content_types.append("T")
+                if rule.forward_images: content_types.append("I")
+                if rule.forward_videos: content_types.append("V")
+                if rule.forward_documents: content_types.append("D")
+                print(f"   - {source_name} -> {dest_name} [{'/'.join(content_types)}]")
+        else:
+            print("\nNo forwarding rules enabled")
+        
+        print("\n" + "="*50)
+        print("Press Ctrl+C to stop")
+        print("="*50 + "\n")
+        
+        try:
+            async def scraping_loop():
+                while self.continuous_scraping_active:
+                    start_time = time.time()
+                    
+                    for channel in list(self.state['channels'].keys()):
+                        if not self.continuous_scraping_active:
+                            break
+                        channel_name = self.state.get('channel_names', {}).get(channel, 'Unknown')
+                        print(f"\n[{time.strftime('%H:%M:%S')}] Checking: {channel_name}")
+                        await self.scrape_channel(channel, self.state['channels'][channel])
+                    
+                    if self.continuous_scraping_active:
+                        elapsed = time.time() - start_time
+                        sleep_time = max(0, 60 - elapsed)
+                        if sleep_time > 0:
+                            next_check = time.strftime('%H:%M:%S', time.localtime(time.time() + sleep_time))
+                            print(f"\nNext scrape cycle at {next_check}")
+                            await asyncio.sleep(sleep_time)
+            
+            scraping_task = asyncio.create_task(scraping_loop())
+
+            while self.continuous_scraping_active:
+                if not await self.ensure_client_connected("Combined service"):
+                    break
+
+                try:
+                    await self.client.run_until_disconnected()
+                except asyncio.CancelledError:
+                    raise
+                except ConnectionError:
+                    if self.continuous_scraping_active:
+                        print("\nConnection lost. Reconnecting combined service...")
+                        await asyncio.sleep(5)
+                except Exception as e:
+                    if self.continuous_scraping_active:
+                        print(f"\nCombined service stopped unexpectedly: {e}")
+                        await asyncio.sleep(5)
+            
+        except asyncio.CancelledError:
+            pass
+        except ConnectionError:
+            print("\nConnection lost")
+        except Exception as e:
+            print(f"\nService stopped: {e}")
+        finally:
+            self.continuous_scraping_active = False
+            self.forwarding_active = False
+            print("\nCombined service stopped")
+
+    def get_export_filename(self, channel: str):
+        username = self.state.get('channel_names', {}).get(channel, 'no_username')
+        return f"{channel}_{username}"
+
+    def export_to_csv(self, channel: str):
+        conn = self.get_db_connection(channel)
+        filename = self.get_export_filename(channel)
+        csv_file = Path(channel) / f'{filename}.csv'
+
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM messages ORDER BY date')
+        columns = [description[0] for description in cursor.description]
+
+        with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(columns)
+
+            while True:
+                rows = cursor.fetchmany(1000)
+                if not rows:
+                    break
+                writer.writerows(rows)
+
+    def export_to_json(self, channel: str):
+        conn = self.get_db_connection(channel)
+        filename = self.get_export_filename(channel)
+        json_file = Path(channel) / f'{filename}.json'
+
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM messages ORDER BY date')
+        columns = [description[0] for description in cursor.description]
+
+        with open(json_file, 'w', encoding='utf-8') as f:
+            f.write('[\n')
+            first_row = True
+
+            while True:
+                rows = cursor.fetchmany(1000)
+                if not rows:
+                    break
+
+                for row in rows:
+                    if not first_row:
+                        f.write(',\n')
+                    else:
+                        first_row = False
+
+                    data = dict(zip(columns, row))
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+
+            f.write('\n]')
+
+    async def export_data(self):
+        if not self.state['channels']:
+            print("No channels to export")
+            return
+            
+        for channel in self.state['channels']:
+            print(f"Exporting data for channel {channel}...")
+            try:
+                self.export_to_csv(channel)
+                self.export_to_json(channel)
+                print(f"✅ Completed export for channel {channel}")
+            except Exception as e:
+                print(f"❌ Export failed for channel {channel}: {e}")
+
+    async def view_channels(self):
+        if not self.state['channels']:
+            print("No channels saved")
+            return
+
+        if not self.client.is_connected():
+            await self.client.connect()
+
+        print("\nCurrent channels:")
+        for i, (channel, last_id) in enumerate(self.state['channels'].items(), 1):
+            try:
+                channel_name = self.state.get('channel_names', {}).get(channel)
+                
+                if not channel_name or channel_name in ['Unknown', 'no_username']:
+                    try:
+                        if channel.lstrip('-').isdigit():
+                            entity = await self.client.get_entity(PeerChannel(int(channel)))
+                        else:
+                            entity = await self.client.get_entity(channel)
+                        channel_name = getattr(entity, 'title', None) or getattr(entity, 'username', None) or 'Unknown'
+                        if 'channel_names' not in self.state:
+                            self.state['channel_names'] = {}
+                        self.state['channel_names'][channel] = channel_name
+                        self.save_state()
+                    except:
+                        channel_name = 'Unknown'
+                
+                conn = self.get_db_connection(channel)
+                cursor = conn.cursor()
+                cursor.execute('SELECT COUNT(*) FROM messages')
+                count = cursor.fetchone()[0]
+                print(f"[{i}] {channel_name} (ID: {channel}), Last Message ID: {last_id}, Messages: {count}")
+            except:
+                channel_name = self.state.get('channel_names', {}).get(channel, 'Unknown')
+                print(f"[{i}] {channel_name} (ID: {channel}), Last Message ID: {last_id}")
+
+    async def list_channels(self):
+        try:
+            if not self.client.is_connected():
+                await self.client.connect()
+            
+            print("\nList of channels and groups joined by account:")
+            count = 1
+            channels_data = []
+            async for dialog in self.client.iter_dialogs():
+                entity = dialog.entity
+                if dialog.id != 777000 and (isinstance(entity, Channel) or isinstance(entity, Chat)):
+                    channel_type = "Channel" if isinstance(entity, Channel) and entity.broadcast else "Group"
+                    username = getattr(entity, 'username', None) or 'no_username'
+                    print(f"[{count}] {dialog.title} (ID: {dialog.id}, Type: {channel_type}, Username: @{username})")
+                    channels_data.append({
+                        'number': count,
+                        'channel_name': dialog.title,
+                        'channel_id': str(dialog.id),
+                        'username': username,
+                        'type': channel_type
+                    })
+                    count += 1
+
+            if channels_data:
+                csv_file = Path('channels_list.csv')
+                with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=['number', 'channel_name', 'channel_id', 'username', 'type'])
+                    writer.writeheader()
+                    writer.writerows(channels_data)
+                print(f"\n✅ Saved channels list to {csv_file}")
+
+            return channels_data
+
+        except Exception as e:
+            print(f"Error listing channels: {e}")
+            return []
+
+    def display_qr_code_ascii(self, qr_login):
+        qr = qrcode.QRCode(box_size=1, border=1)
+        qr.add_data(qr_login.url)
+        qr.make()
+        
+        f = StringIO()
+        qr.print_ascii(out=f)
+        f.seek(0)
+        print(f.read())
+
+    async def qr_code_auth(self):
+        print("\nChoosing QR Code authentication...")
+        print("Please scan the QR code with your Telegram app:")
+        print("1. Open Telegram on your phone")
+        print("2. Go to Settings > Devices > Scan QR")
+        print("3. Scan the code below\n")
+        
+        qr_login = await self.client.qr_login()
+        self.display_qr_code_ascii(qr_login)
+        
+        try:
+            await qr_login.wait()
+            print("\n✅ Successfully logged in via QR code!")
+            return True
+        except SessionPasswordNeededError:
+            password = input("Two-factor authentication enabled. Enter your password: ")
+            await self.client.sign_in(password=password)
+            print("\n✅ Successfully logged in with 2FA!")
+            return True
+        except Exception as e:
+            print(f"\n❌ QR code authentication failed: {e}")
+            return False
+
+    async def phone_auth(self):
+        phone = input("Enter your phone number: ")
+        await self.client.send_code_request(phone)
+        code = input("Enter the code you received: ")
+        
+        try:
+            await self.client.sign_in(phone, code)
+            print("\n✅ Successfully logged in via phone!")
+            return True
+        except SessionPasswordNeededError:
+            password = input("Two-factor authentication enabled. Enter your password: ")
+            await self.client.sign_in(password=password)
+            print("\n✅ Successfully logged in with 2FA!")
+            return True
+        except Exception as e:
+            print(f"\n❌ Phone authentication failed: {e}")
+            return False
+
+    # ── Proxy Configuration ──────────────────────────────────────────────
+
+    def get_proxy_tuple(self):
+        """Convert stored proxy config into a tuple Telethon understands."""
+        proxy_cfg = self.state.get('proxy')
+        if not proxy_cfg or not proxy_cfg.get('enabled'):
+            return None
+
+        proxy_type_map = {
+            'socks5': socks.SOCKS5 if PROXY_SUPPORT else None,
+            'socks4': socks.SOCKS4 if PROXY_SUPPORT else None,
+            'http': socks.HTTP if PROXY_SUPPORT else None,
+        }
+
+        ptype = proxy_type_map.get(proxy_cfg.get('type', 'socks5'))
+        if ptype is None:
+            return None
+
+        proxy = (ptype, proxy_cfg['host'], int(proxy_cfg['port']))
+        if proxy_cfg.get('username'):
+            proxy = proxy + (True, proxy_cfg['username'], proxy_cfg.get('password', ''))
+        return proxy
+
+    async def configure_proxy(self):
+        """Interactive proxy setup."""
+        print("\n" + "="*45)
+        print("           PROXY CONFIGURATION")
+        print("="*45)
+
+        if not PROXY_SUPPORT:
+            print("\n⚠️  Proxy dependencies not installed.")
+            print("   Install with:  pip install pysocks python-socks[asyncio]")
+            print("   Then restart the scraper.")
+            return
+
+        current = self.state.get('proxy')
+        if current and current.get('enabled'):
+            print(f"\nCurrent proxy: {current['type'].upper()} "
+                  f"{current['host']}:{current['port']}"
+                  f"{' (auth)' if current.get('username') else ''}")
+        else:
+            print("\nProxy: not configured")
+
+        print("\n[1] Set up SOCKS5 proxy")
+        print("[2] Set up SOCKS4 proxy")
+        print("[3] Set up HTTP proxy")
+        print("[T] Test current proxy")
+        print("[4] Disable / remove proxy")
+        print("[5] Back")
+        print("="*45)
+
+        choice = input("Enter your choice: ").strip().lower()
+
+        if choice == 't':
+            await self.test_proxy()
+            return
+
+        if choice in ('1', '2', '3'):
+            type_map = {'1': 'socks5', '2': 'socks4', '3': 'http'}
+            proxy_type = type_map[choice]
+
+            host = input("Proxy host (e.g. 127.0.0.1): ").strip()
+            if not host:
+                print("❌ Host cannot be empty")
+                return
+
+            port_str = input("Proxy port (e.g. 1080): ").strip()
+            try:
+                port = int(port_str)
+                if not (1 <= port <= 65535):
+                    raise ValueError
+            except ValueError:
+                print("❌ Invalid port number")
+                return
+
+            use_auth = input("Proxy requires authentication? (y/n): ").lower().strip()
+            username = password = ''
+            if use_auth == 'y':
+                username = input("Username: ").strip()
+                password = input("Password: ").strip()
+
+            self.state['proxy'] = {
+                'enabled': True,
+                'type': proxy_type,
+                'host': host,
+                'port': port,
+                'username': username,
+                'password': password,
+            }
+            self.save_state()
+            print(f"\n✅ {proxy_type.upper()} proxy configured: {host}:{port}")
+            print("   Restart the scraper or re-initialize the client for changes to take effect.")
+
+        elif choice == '4':
+            self.state['proxy'] = None
+            self.save_state()
+            print("\n✅ Proxy removed. Direct connection will be used on next start.")
+
+    async def test_proxy(self):
+        """Test proxy connectivity by comparing direct vs proxied IP."""
+        proxy_cfg = self.state.get('proxy')
+        if not proxy_cfg or not proxy_cfg.get('enabled'):
+            print("\n❌ No proxy configured. Set one up first.")
+            return
+
+        if not PROXY_SUPPORT:
+            print("\n⚠️  Proxy dependencies not installed.")
+            print("   Install with:  pip install pysocks python-socks[asyncio]")
+            return
+
+        import socket
+
+        proxy_type = proxy_cfg['type'].upper()
+        host = proxy_cfg['host']
+        port = int(proxy_cfg['port'])
+
+        print(f"\n🔍 Testing {proxy_type} proxy at {host}:{port}...")
+        print("─" * 45)
+
+        # Step 1: Basic TCP connectivity to the proxy server
+        print("\n[1/3] Checking proxy is reachable...")
+        try:
+            sock = socket.create_connection((host, port), timeout=10)
+            sock.close()
+            print(f"  ✅ Proxy server {host}:{port} is reachable")
+        except socket.timeout:
+            print(f"  ❌ Connection timed out — proxy at {host}:{port} is not responding")
+            return
+        except ConnectionRefusedError:
+            print(f"  ❌ Connection refused — nothing is listening on {host}:{port}")
+            return
+        except OSError as e:
+            print(f"  ❌ Cannot reach proxy: {e}")
+            return
+
+        # Step 2: Connect to Telegram through the proxy
+        print(f"\n[2/2] Connecting to Telegram API through {proxy_type} proxy...")
+
+        proxy = self.get_proxy_tuple()
+        if not proxy:
+            print("  ❌ Failed to build proxy configuration")
+            return
+
+        try:
+            from telethon import TelegramClient as TestClient
+
+            test_client = TestClient(
+                'proxy_test_session',
+                self.state['api_id'],
+                self.state['api_hash'],
+                proxy=proxy,
+                timeout=20,
+                connection_retries=1,
+            )
+
+            await test_client.connect()
+
+            if await test_client.is_user_authorized():
+                me = await test_client.get_me()
+                display_name = me.first_name or ''
+                if me.last_name:
+                    display_name += f' {me.last_name}'
+                print(f"  ✅ Authenticated as: {display_name} (@{me.username or 'no username'})")
+
+                # Try fetching dialogs as an extra connectivity check
+                dialog_count = 0
+                async for _ in test_client.iter_dialogs(limit=5):
+                    dialog_count += 1
+                print(f"  ✅ Successfully fetched {dialog_count} dialog(s)")
+            else:
+                # Not authorized but connection worked
+                print("  ✅ Connected to Telegram servers (not logged in on this session)")
+
+            await test_client.disconnect()
+
+            # Clean up test session file
+            for f in Path('.').glob('proxy_test_session*'):
+                try:
+                    f.unlink()
+                except:
+                    pass
+
+            print("\n" + "─" * 45)
+            print(f"✅ PROXY IS WORKING!")
+            print(f"   {proxy_type} {host}:{port}")
+            print(f"   Successfully reached Telegram servers through proxy.")
+            print("─" * 45)
+
+        except ConnectionError as e:
+            print(f"  ❌ Connection failed: {e}")
+            print("     The proxy could not reach Telegram's servers.")
+            return
+        except socket.timeout:
+            print("  ❌ Connection timed out reaching Telegram through proxy")
+            return
+        except OSError as e:
+            error_msg = str(e)
+            if '407' in error_msg or 'auth' in error_msg.lower():
+                print("  ❌ Proxy authentication failed — check username/password")
+            else:
+                print(f"  ❌ Connection error: {e}")
+            return
+        except Exception as e:
+            print(f"  ❌ Failed to connect: {e}")
+            return
+        finally:
+            # Clean up test session file on failure too
+            for f in Path('.').glob('proxy_test_session*'):
+                try:
+                    f.unlink()
+                except:
+                    pass
+
+    # ── Search / Query Database ───────────────────────────────────────────
+
+    async def search_messages(self):
+        """Interactive database search across scraped channels."""
+        if not self.state['channels']:
+            print("No channels available. Add and scrape channels first.")
+            return
+
+        while True:
+            print("\n" + "="*45)
+            print("            DATABASE SEARCH")
+            print("="*45)
+            print("[K] Search by keyword / regex")
+            print("[D] Search by date range")
+            print("[U] Search by sender / username")
+            print("[T] Search by media type")
+            print("[A] Advanced search (combine filters)")
+            print("[B] Back")
+            print("="*45)
+
+            choice = input("Enter your choice: ").lower().strip()
+
+            if choice == 'b':
+                break
+            elif choice == 'k':
+                await self._search_keyword()
+            elif choice == 'd':
+                await self._search_date_range()
+            elif choice == 'u':
+                await self._search_sender()
+            elif choice == 't':
+                await self._search_media_type()
+            elif choice == 'a':
+                await self._search_advanced()
+            else:
+                print("Invalid option")
+
+    def _pick_search_channels(self) -> List[str]:
+        """Let user pick which channels to search."""
+        channels_list = list(self.state['channels'].keys())
+        if len(channels_list) == 1:
+            return channels_list
+
+        print("\nSearch in which channel(s)?")
+        for i, ch in enumerate(channels_list, 1):
+            name = self.state.get('channel_names', {}).get(ch, ch)
+            print(f"  [{i}] {name} ({ch})")
+        print(f"  [A] All channels")
+
+        sel = input("Selection: ").strip().lower()
+        if sel == 'a':
+            return channels_list
+
+        selected = []
+        for s in sel.split(','):
+            s = s.strip()
+            try:
+                num = int(s)
+                if 1 <= num <= len(channels_list):
+                    selected.append(channels_list[num - 1])
+            except ValueError:
+                if s in self.state['channels']:
+                    selected.append(s)
+        return selected or channels_list
+
+    def _execute_search(self, channels: List[str], conditions: List[str],
+                        params: List, use_regex: bool = False,
+                        regex_pattern: str = None, limit: int = 50) -> List[dict]:
+        """Run a query across selected channels and return results."""
+        all_results = []
+        for ch in channels:
+            conn = self.get_db_connection(ch)
+            cursor = conn.cursor()
+            ch_name = self.state.get('channel_names', {}).get(ch, ch)
+
+            where = ' AND '.join(conditions) if conditions else '1=1'
+            query = f"SELECT message_id, date, sender_id, first_name, last_name, username, message, media_type, views, forwards, reactions FROM messages WHERE {where} ORDER BY date DESC"
+
+            if use_regex:
+                # filter with LIKE first for speed, then regex in Python
+                cursor.execute(query, params)
+            else:
+                query += f" LIMIT {limit - len(all_results)}"
+                cursor.execute(query, params)
+
+            for row in cursor.fetchall():
+                record = {
+                    'channel': ch_name,
+                    'channel_id': ch,
+                    'message_id': row[0],
+                    'date': row[1],
+                    'sender_id': row[2],
+                    'name': ' '.join(filter(None, [row[3], row[4]])) or str(row[2] or ''),
+                    'username': row[5] or '',
+                    'message': row[6] or '',
+                    'media_type': row[7],
+                    'views': row[8],
+                    'forwards': row[9],
+                    'reactions': row[10],
+                }
+
+                if use_regex and regex_pattern:
+                    if not re.search(regex_pattern, record['message'], re.IGNORECASE):
+                        continue
+
+                all_results.append(record)
+                if len(all_results) >= limit:
+                    break
+
+            if len(all_results) >= limit:
+                break
+
+        return all_results
+
+    def _display_results(self, results: List[dict], show_channel: bool = True):
+        """Pretty-print search results."""
+        if not results:
+            print("\n🔍 No results found.")
+            return
+
+        print(f"\n🔍 Found {len(results)} result(s):\n")
+        print("─" * 70)
+
+        for r in results:
+            header_parts = [f"[{r['date']}]"]
+            if show_channel:
+                header_parts.append(f"#{r['channel']}")
+            sender = f"@{r['username']}" if r['username'] else r['name']
+            if sender:
+                header_parts.append(sender)
+            header_parts.append(f"(msg:{r['message_id']})")
+            print(' '.join(header_parts))
+
+            text = r['message']
+            if text:
+                # Show up to 300 chars
+                display_text = text[:300] + ('...' if len(text) > 300 else '')
+                for line in display_text.split('\n'):
+                    print(f"  {line}")
+
+            meta = []
+            if r['media_type']:
+                meta.append(f"media:{r['media_type']}")
+            if r['views']:
+                meta.append(f"views:{r['views']}")
+            if r['forwards']:
+                meta.append(f"fwd:{r['forwards']}")
+            if r['reactions']:
+                meta.append(f"reactions:{r['reactions']}")
+            if meta:
+                print(f"  📊 {' | '.join(meta)}")
+
+            print("─" * 70)
+
+        if len(results) >= 50:
+            print("(Showing first 50 results. Use Advanced search to change the limit.)")
+
+    async def _search_keyword(self):
+        channels = self._pick_search_channels()
+
+        print("\nEnter search term (prefix with r/ for regex, e.g. r/price.*drop):")
+        term = input("Search: ").strip()
+        if not term:
+            print("❌ Empty search term")
+            return
+
+        use_regex = term.startswith('r/')
+        if use_regex:
+            regex_pattern = term[2:]
+            try:
+                re.compile(regex_pattern)
+            except re.error as e:
+                print(f"❌ Invalid regex: {e}")
+                return
+            # Use a broad LIKE to pre-filter before regex
+            conditions = ["message LIKE ?"]
+            # Extract alphanumeric fragments for LIKE pre-filter
+            fragments = re.findall(r'[a-zA-Z0-9]+', regex_pattern)
+            like_term = f"%{fragments[0]}%" if fragments else "%"
+            params = [like_term]
+        else:
+            conditions = ["message LIKE ?"]
+            params = [f"%{term}%"]
+            regex_pattern = None
+
+        results = self._execute_search(channels, conditions, params,
+                                       use_regex=use_regex,
+                                       regex_pattern=regex_pattern)
+        self._display_results(results, show_channel=len(channels) > 1)
+
+    async def _search_date_range(self):
+        channels = self._pick_search_channels()
+
+        print("\nEnter date range (YYYY-MM-DD). Press Enter to leave open-ended.")
+        start = input("Start date: ").strip()
+        end = input("End date:   ").strip()
+
+        conditions = []
+        params = []
+        if start:
+            conditions.append("date >= ?")
+            params.append(start)
+        if end:
+            conditions.append("date < date(?, '+1 day')")
+            params.append(end)
+
+        if not conditions:
+            print("❌ Provide at least one date")
+            return
+
+        results = self._execute_search(channels, conditions, params)
+        self._display_results(results, show_channel=len(channels) > 1)
+
+    async def _search_sender(self):
+        channels = self._pick_search_channels()
+
+        print("\nSearch by username (without @) or first/last name:")
+        term = input("Sender: ").strip()
+        if not term:
+            print("❌ Empty search term")
+            return
+
+        conditions = ["(username LIKE ? OR first_name LIKE ? OR last_name LIKE ?)"]
+        like = f"%{term}%"
+        params = [like, like, like]
+
+        results = self._execute_search(channels, conditions, params)
+        self._display_results(results, show_channel=len(channels) > 1)
+
+    async def _search_media_type(self):
+        channels = self._pick_search_channels()
+
+        print("\nFilter by media type:")
+        print("  [1] Photos only")
+        print("  [2] Videos only")
+        print("  [3] Documents only")
+        print("  [4] Text only (no media)")
+        print("  [5] Any media")
+
+        choice = input("Selection: ").strip()
+        conditions = []
+        params = []
+
+        if choice == '1':
+            conditions.append("media_type = 'MessageMediaPhoto'")
+        elif choice == '2':
+            conditions.append("media_type = 'MessageMediaDocument'")
+            conditions.append("(media_path LIKE '%.mp4' OR media_path LIKE '%.mov' OR media_path LIKE '%.avi' OR media_path LIKE '%.mkv' OR media_path LIKE '%.webm')")
+        elif choice == '3':
+            conditions.append("media_type = 'MessageMediaDocument'")
+            conditions.append("(media_path NOT LIKE '%.mp4' AND media_path NOT LIKE '%.mov' AND media_path NOT LIKE '%.avi' AND media_path NOT LIKE '%.mkv' AND media_path NOT LIKE '%.webm')")
+        elif choice == '4':
+            conditions.append("media_type IS NULL")
+            conditions.append("message != ''")
+        elif choice == '5':
+            conditions.append("media_type IS NOT NULL")
+            conditions.append("media_type != 'MessageMediaWebPage'")
+        else:
+            print("Invalid option")
+            return
+
+        results = self._execute_search(channels, conditions, params)
+        self._display_results(results, show_channel=len(channels) > 1)
+
+    async def _search_advanced(self):
+        channels = self._pick_search_channels()
+
+        print("\n" + "="*45)
+        print("         ADVANCED SEARCH")
+        print("="*45)
+        print("Leave any field blank to skip that filter.\n")
+
+        conditions = []
+        params = []
+        use_regex = False
+        regex_pattern = None
+
+        # Keyword
+        keyword = input("Keyword (prefix r/ for regex): ").strip()
+        if keyword:
+            if keyword.startswith('r/'):
+                use_regex = True
+                regex_pattern = keyword[2:]
+                try:
+                    re.compile(regex_pattern)
+                except re.error as e:
+                    print(f"❌ Invalid regex: {e}")
+                    return
+                fragments = re.findall(r'[a-zA-Z0-9]+', regex_pattern)
+                if fragments:
+                    conditions.append("message LIKE ?")
+                    params.append(f"%{fragments[0]}%")
+            else:
+                conditions.append("message LIKE ?")
+                params.append(f"%{keyword}%")
+
+        # Date range
+        start = input("Start date (YYYY-MM-DD): ").strip()
+        if start:
+            conditions.append("date >= ?")
+            params.append(start)
+
+        end = input("End date   (YYYY-MM-DD): ").strip()
+        if end:
+            conditions.append("date < date(?, '+1 day')")
+            params.append(end)
+
+        # Sender
+        sender = input("Sender (username or name): ").strip()
+        if sender:
+            like = f"%{sender}%"
+            conditions.append("(username LIKE ? OR first_name LIKE ? OR last_name LIKE ?)")
+            params.extend([like, like, like])
+
+        # Media filter
+        media = input("Media filter (photo/video/doc/text/any or blank): ").strip().lower()
+        if media == 'photo':
+            conditions.append("media_type = 'MessageMediaPhoto'")
+        elif media == 'video':
+            conditions.append("media_type = 'MessageMediaDocument'")
+            conditions.append("(media_path LIKE '%.mp4' OR media_path LIKE '%.mov' OR media_path LIKE '%.avi' OR media_path LIKE '%.mkv' OR media_path LIKE '%.webm')")
+        elif media == 'doc':
+            conditions.append("media_type = 'MessageMediaDocument'")
+        elif media == 'text':
+            conditions.append("media_type IS NULL")
+        elif media == 'any':
+            conditions.append("media_type IS NOT NULL")
+            conditions.append("media_type != 'MessageMediaWebPage'")
+
+        # Min views
+        min_views = input("Minimum views (blank to skip): ").strip()
+        if min_views:
+            try:
+                conditions.append("views >= ?")
+                params.append(int(min_views))
+            except ValueError:
+                pass
+
+        # Result limit
+        limit_str = input("Max results [50]: ").strip()
+        try:
+            limit = int(limit_str) if limit_str else 50
+            limit = max(1, min(limit, 500))
+        except ValueError:
+            limit = 50
+
+        results = self._execute_search(channels, conditions, params,
+                                       use_regex=use_regex,
+                                       regex_pattern=regex_pattern,
+                                       limit=limit)
+        self._display_results(results, show_channel=len(channels) > 1)
+
+    # ── Client Initialization ─────────────────────────────────────────────
+
+    async def initialize_client(self):
+        if not all([self.state.get('api_id'), self.state.get('api_hash')]):
+            print("\n=== API Configuration Required ===")
+            print("You need to provide API credentials from https://my.telegram.org")
+            try:
+                self.state['api_id'] = int(input("Enter your API ID: "))
+                self.state['api_hash'] = input("Enter your API Hash: ")
+                self.save_state()
+            except ValueError:
+                print("Invalid API ID. Must be a number.")
+                return False
+
+        proxy = self.get_proxy_tuple()
+        if proxy:
+            proxy_cfg = self.state['proxy']
+            print(f"🌐 Using {proxy_cfg['type'].upper()} proxy: {proxy_cfg['host']}:{proxy_cfg['port']}")
+            self.client = TelegramClient('session', self.state['api_id'], self.state['api_hash'],
+                                         proxy=proxy)
+        else:
+            self.client = TelegramClient('session', self.state['api_id'], self.state['api_hash'])
+        
+        try:
+            await self.client.connect()
+        except Exception as e:
+            print(f"Failed to connect: {e}")
+            return False
+        
+        if not await self.client.is_user_authorized():
+            print("\n=== Choose Authentication Method ===")
+            print("[1] QR Code (Recommended - No phone number needed)")
+            print("[2] Phone Number (Traditional method)")
+            
+            while True:
+                choice = input("Enter your choice (1 or 2): ").strip()
+                if choice in ['1', '2']:
+                    break
+                print("Please enter 1 or 2")
+            
+            success = await self.qr_code_auth() if choice == '1' else await self.phone_auth()
+                
+            if not success:
+                print("Authentication failed. Please try again.")
+                await self.client.disconnect()
+                return False
+        else:
+            print("✅ Already authenticated!")
+            
+        return True
+
+    def parse_channel_selection(self, choice):
+        channels_list = list(self.state['channels'].keys())
+        selected_channels = []
+        
+        if choice.lower() == 'all':
+            return channels_list
+        
+        for selection in [x.strip() for x in choice.split(',')]:
+            try:
+                if selection.startswith('-'):
+                    if selection in self.state['channels']:
+                        selected_channels.append(selection)
+                    else:
+                        print(f"Channel ID {selection} not found in your channels")
+                else:
+                    num = int(selection)
+                    if 1 <= num <= len(channels_list):
+                        selected_channels.append(channels_list[num - 1])
+                    else:
+                        print(f"Invalid channel number: {num}. Valid range: 1-{len(channels_list)}")
+            except ValueError:
+                print(f"Invalid input: {selection}. Use numbers (1,2,3) or full IDs (-100123...)")
+        
+        return selected_channels
+
+    async def scrape_specific_channels(self):
+        if not self.state['channels']:
+            print("No channels available. Use [L] to add channels first")
+            return
+
+        await self.view_channels()
+        print("\n📥 Scrape Options:")
+        print("• Single: 1 or -1001234567890")
+        print("• Multiple: 1,3,5 or mix formats")
+        print("• All channels: all")
+        
+        choice = input("\nEnter selection: ").strip()
+        selected_channels = self.parse_channel_selection(choice)
+        
+        if selected_channels:
+            print(f"\n🚀 Starting scrape of {len(selected_channels)} channel(s)...")
+            for i, channel in enumerate(selected_channels, 1):
+                print(f"\n[{i}/{len(selected_channels)}] Scraping: {channel}")
+                await self.scrape_channel(channel, self.state['channels'][channel])
+            print(f"\n✅ Completed scraping {len(selected_channels)} channel(s)!")
+        else:
+            print("❌ No valid channels selected")
+
+    async def manage_channels(self):
+        while True:
+            print("\n" + "="*40)
+            print("           TELEGRAM SCRAPER")
+            print("="*40)
+            print("[S] Scrape channels")
+            print("[C] Continuous scraping")
+            print("[B] Combined scrape + forward")
+            print(f"[M] Media scraping: {'ON' if self.state['scrape_media'] else 'OFF'}")
+            print("[O] Media download folder")
+            print("[U] Clear per-channel overrides")
+            print("[L] List & add channels")
+            print("[R] Remove channels")
+            print("[E] Export data")
+            print("[T] Rescrape media")
+            print("[F] Fix missing media")
+            print("[W] Forwarding rules")
+            print("[D] Search database")
+            print("[P] Proxy settings")
+            print("[Q] Quit")
+            print("="*40)
+
+            choice = input("Enter your choice: ").lower().strip()
+            
+            try:
+                if choice == 'r':
+                    if not self.state['channels']:
+                        print("No channels to remove")
+                        continue
+                        
+                    await self.view_channels()
+                    print("\nTo remove channels:")
+                    print("• Single: 1 or -1001234567890")
+                    print("• Multiple: 1,2,3 or mix formats")
+                    selection = input("Enter selection: ").strip()
+                    selected_channels = self.parse_channel_selection(selection)
+                    
+                    if selected_channels:
+                        removed_count = 0
+                        for channel in selected_channels:
+                            if channel in self.state['channels']:
+                                del self.state['channels'][channel]
+                                print(f"✅ Removed channel {channel}")
+                                removed_count += 1
+                            else:
+                                print(f"❌ Channel {channel} not found")
+                        
+                        if removed_count > 0:
+                            self.save_state()
+                            print(f"\n🎉 Removed {removed_count} channel(s)!")
+                            await self.view_channels()
+                        else:
+                            print("No channels were removed")
+                    else:
+                        print("No valid channels selected")
+                        
+                elif choice == 's':
+                    await self.scrape_specific_channels()
+                    
+                elif choice == 'm':
+                    self.state['scrape_media'] = not self.state['scrape_media']
+                    self.save_state()
+                    print(f"\n✅ Media scraping {'enabled' if self.state['scrape_media'] else 'disabled'}")
+
+                elif choice == 'o':
+                    self.configure_media_download_folder()
+
+                elif choice == 'u':
+                    self.clear_media_download_overrides()
+                    
+                elif choice == 'c':
+                    task = asyncio.create_task(self.continuous_scraping())
+                    print("Continuous scraping started. Press Ctrl+C to stop.")
+                    try:
+                        await asyncio.sleep(float('inf'))
+                    except KeyboardInterrupt:
+                        self.continuous_scraping_active = False
+                        task.cancel()
+                        print("\nStopping continuous scraping...")
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                
+                elif choice == 'b':
+                    if not self.state['channels'] and not any(r.get('enabled', True) for r in self.state.get('forwarding_rules', [])):
+                        print("❌ No channels to scrape and no forwarding rules enabled.")
+                        print("   Add channels with [L] or configure forwarding with [W] first.")
+                        continue
+                    try:
+                        await self.continuous_scraping_with_forwarding()
+                    except KeyboardInterrupt:
+                        self.continuous_scraping_active = False
+                        self.forwarding_active = False
+                        print("\nStopping combined service...")
+                            
+                elif choice == 'e':
+                    await self.export_data()
+                    
+                elif choice == 'l':
+                    channels_data = await self.list_channels()
+
+                    if not channels_data:
+                        continue
+
+                    print("\nTo add channels from the list above:")
+                    print("• Single: 1 or -1001234567890")
+                    print("• Multiple: 1,3,5 or mix formats")
+                    print("• All channels: all")
+                    print("• Press Enter to skip adding")
+                    selection = input("\nEnter selection (or Enter to skip): ").strip()
+
+                    if selection:
+                        added_count = 0
+
+                        if selection.lower() == 'all':
+                            for channel_info in channels_data:
+                                channel_id = channel_info['channel_id']
+                                if channel_id not in self.state['channels']:
+                                    self.state['channels'][channel_id] = 0
+                                    if 'channel_names' not in self.state:
+                                        self.state['channel_names'] = {}
+                                    self.state['channel_names'][channel_id] = channel_info['username']
+                                    print(f"✅ Added channel {channel_info['channel_name']} (ID: {channel_id})")
+                                    added_count += 1
+                                else:
+                                    print(f"Channel {channel_info['channel_name']} already added")
+                        else:
+                            for sel in [x.strip() for x in selection.split(',')]:
+                                try:
+                                    if sel.startswith('-'):
+                                        channel_id = sel
+                                        channel_info = next((c for c in channels_data if c['channel_id'] == channel_id), None)
+                                        if not channel_info:
+                                            print(f"Channel ID {channel_id} not found")
+                                            continue
+                                    else:
+                                        num = int(sel)
+                                        if 1 <= num <= len(channels_data):
+                                            channel_info = channels_data[num - 1]
+                                            channel_id = channel_info['channel_id']
+                                        else:
+                                            print(f"Invalid number: {num}. Choose 1-{len(channels_data)}")
+                                            continue
+
+                                    if channel_id in self.state['channels']:
+                                        print(f"Channel {channel_info['channel_name']} already added")
+                                    else:
+                                        self.state['channels'][channel_id] = 0
+                                        if 'channel_names' not in self.state:
+                                            self.state['channel_names'] = {}
+                                        self.state['channel_names'][channel_id] = channel_info['username']
+                                        print(f"✅ Added channel {channel_info['channel_name']} (ID: {channel_id})")
+                                        added_count += 1
+
+                                except ValueError:
+                                    print(f"Invalid input: {sel}")
+
+                        if added_count > 0:
+                            self.save_state()
+                            print(f"\n🎉 Added {added_count} new channel(s)!")
+                            await self.view_channels()
+                        else:
+                            print("No new channels were added")
+                    
+                elif choice == 't':
+                    if not self.state['channels']:
+                        print("No channels available. Add channels first")
+                        continue
+                        
+                    await self.view_channels()
+                    print("\nEnter channel NUMBER (1,2,3...) or full channel ID (-100123...)")
+                    selection = input("Enter your selection: ").strip()
+                    selected_channels = self.parse_channel_selection(selection)
+                    
+                    if len(selected_channels) == 1:
+                        channel = selected_channels[0]
+                        print(f"Rescaping media for channel: {channel}")
+                        await self.rescrape_media(channel)
+                    elif len(selected_channels) > 1:
+                        print("Please select only one channel for media rescaping")
+                    else:
+                        print("No valid channel selected")
+                    
+                elif choice == 'f':
+                    if not self.state['channels']:
+                        print("No channels available. Add channels first")
+                        continue
+                        
+                    await self.view_channels()
+                    print("\nEnter channel NUMBER (1,2,3...) or full channel ID (-100123...)")
+                    selection = input("Enter your selection: ").strip()
+                    selected_channels = self.parse_channel_selection(selection)
+                    
+                    if len(selected_channels) == 1:
+                        channel = selected_channels[0]
+                        await self.fix_missing_media(channel)
+                    elif len(selected_channels) > 1:
+                        print("Please select only one channel for fixing missing media")
+                    else:
+                        print("No valid channel selected")
+                
+                elif choice == 'w':
+                    await self.manage_forwarding_rules()
+
+                elif choice == 'd':
+                    await self.search_messages()
+
+                elif choice == 'p':
+                    await self.configure_proxy()
+                    
+                elif choice == 'q':
+                    print("\n👋 Goodbye!")
+                    self.close_db_connections()
+                    if self.client:
+                        await self.client.disconnect()
+                    sys.exit()
+                    
+                else:
+                    print("Invalid option")
+                    
+            except Exception as e:
+                print(f"Error: {e}")
+
+    async def run(self):
+        display_ascii_art()
+        if await self.initialize_client():
+            try:
+                await self.manage_channels()
+            finally:
+                self.close_db_connections()
+                if self.client:
+                    await self.client.disconnect()
+        else:
+            print("Failed to initialize client. Exiting.")
+
+async def main():
+    scraper = OptimizedTelegramScraper()
+    await scraper.run()
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nProgram interrupted. Exiting...")
+        sys.exit()

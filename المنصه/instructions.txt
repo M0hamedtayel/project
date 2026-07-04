@@ -1,0 +1,75 @@
+php artisan telegram:set-webhook https://verify-prude-chooser.ngrok-free.dev 
+
+الكلام اللي فوق دا عشان لما اجي افعل التيلي للاكونت المنصه تعرف تكلم تليجرام من خلاله 
+
+
+
+php artisan serve --host=0.0.0.0 --port=8000 
+تشغيل كود الباك اند و مخلي الهوست كدا عشان يعرف يكلم الماشين 
+
+
+
+
+
+npm run dev 
+تشغيل كود الفرونت 
+
+
+
+
+
+php artisan schedule:work
+دا عشان اي حاجة متجدوله ف المنصه 
+
+
+
+
+و اخر حاجة مشغل على دوكر دول 
+
+
+kibana
+
+0b6b96461332
+
+kibana/kibana:8.12.2
+5601:5601
+7.31%
+654MB / 15.51GB
+4.12%
+467MB / 0B
+1.47GB / 2.05GB
+12
+7 days ago
+redis
+
+d6add4aaca6c
+
+redis:alpine
+6379:6379
+
+
+
+
+elasticsearch
+
+735dcbf18cca
+
+elasticsearch/elasticsearch:8.12.2
+9200:9200
+
+
+
+
+
+
+اخر حاجة المفروض فيه كودين مع طايل بتوع الكراولرز و سكرابر التيلي و دول المفروض يتخزنوا في مونجو دي بي 
+
+
+
+
+
+
+
+
+
+
