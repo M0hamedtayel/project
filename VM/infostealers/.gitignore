@@ -1,0 +1,43 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Parent directory symlinks
+.git - Copy/
+.pentesterflow/
+HubSpot/
+New folder/
+XERO/
+Zproxy/
+ascsacs/
+copy from v4/
+crawler_db.threads.json
+darkweb/
+darkweb.zip
+darkweb_monitoring.forum_posts.json
+desktop.ini
+findings/
+httpsconsole.vultr.com.txt
+Mohamed_gaber_220100416.zip
+project.rar
+relevanceais.txt
+tests.py
+udemy/
+v6/
+workspace-3f0fde08-44a9-4881-b700-09ca0eb69974 (2)/
+~$w Microsoft Word Document.docx
+Torrent.lnk
+*.url
+*.lnk
+*.zip
+*.rar
